@@ -32,6 +32,10 @@ static int Bgm_Start(int ch, WmStream_t* s, int volume, int pan)
 	r->fade.active = 0;
 	r->active = 1;
 	Voice_SetVolume(r->voice, Record_Level(r));
+#if defined(__ANDROID__)
+	fprintf(stderr, "snd: android: bgm start ch=%d at %u ms\n", ch, (unsigned)OS_TicksMs());
+	fflush(stderr);
+#endif
 	// the pan of Wm_BgmSetPan: 0 .. 0x80 clamped, then (pan - 0x40) * 2
 	if(pan > 0x80)
 		pan = 0x80;
@@ -190,6 +194,13 @@ int Wm_BgmStop(int ch)
 	int res;
 	Wm_Lock();
 	res = Wm_BgmCheck(ch);
+#if defined(__ANDROID__)
+	if(res == 0)
+	{
+		fprintf(stderr, "snd: android: bgm stop ch=%d at %u ms\n", ch, (unsigned)OS_TicksMs());
+		fflush(stderr);
+	}
+#endif
 	if(res == 0)
 		Voice_Stop(gBgm[ch].voice);
 	Wm_Unlock();
@@ -265,6 +276,13 @@ int Wm_BgmPause(int ch, int paused)
 	int res;
 	Wm_Lock();
 	res = Wm_BgmCheck(ch);
+#if defined(__ANDROID__)
+	if(res == 0)
+	{
+		fprintf(stderr, "snd: android: bgm pause ch=%d paused=%d at %u ms\n", ch, paused, (unsigned)OS_TicksMs());
+		fflush(stderr);
+	}
+#endif
 	if(res == 0)
 		Voice_Pause(gBgm[ch].voice, paused);
 	Wm_Unlock();

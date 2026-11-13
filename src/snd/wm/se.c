@@ -96,6 +96,10 @@ int Wm_SePlay(int slot, int volume, int pan)
 	if(res == 0)
 	{
 		WmRecord_t* r = &gSe[slot];
+#if defined(__ANDROID__)
+		fprintf(stderr, "snd: android: se start slot=%d at %u ms\n", slot, (unsigned)OS_TicksMs());
+		fflush(stderr);
+#endif
 		Se_SetPan(r->voice, pan);
 		r->volume = volume;
 		r->fade.active = 0;
@@ -113,6 +117,13 @@ int Wm_SeStop(int slot)
 	int res;
 	Wm_Lock();
 	res = Wm_SeCheck(slot);
+#if defined(__ANDROID__)
+	if(res == 0)
+	{
+		fprintf(stderr, "snd: android: se stop slot=%d at %u ms\n", slot, (unsigned)OS_TicksMs());
+		fflush(stderr);
+	}
+#endif
 	if(res == 0)
 		Voice_Stop(gSe[slot].voice);
 	Wm_Unlock();

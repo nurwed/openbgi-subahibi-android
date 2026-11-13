@@ -31,6 +31,10 @@
 #include "bgi/file.h"
 #include "bgi/codec.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 VmHandler_t vm_optable_92[256]; // the "92 xx" dispatch table, filled by Vm_Optable92Init
 
 // raise a script error with a formatted message; never returns
@@ -426,9 +430,16 @@ static int Opcode_Gfx2_PreloadImage(Thread_t* t)
 {
 	const char* name = (const char*)PopPtr(t);
 	const char* arc = (const char*)PopPtr(t);
-	uint8_t* buf = (uint8_t*)BGI_Alloc(0x2000000);
+	uint8_t* buf = (uint8_t*)BGI_Alloc(BGI_LOAD_BUFFER);
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 	uint32_t n = LoadFile(buf, arc, name);
 	int ok = n >= 0x10 && (BGI_IsCbg(buf) || ((const RawImageHeader_t*)buf)->bpp % 8 == 0);
+#if defined(__ANDROID__)
+	AndroidProf_Log("preload %s/%s %u B in %llu us", arc && *arc ? arc : "(base)", name, n,
+		(unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	BGI_Free(buf);
 	if(!ok)
 		GFX_ERROR(t, MSG_NOT_BG_FILE, arc, name);
@@ -618,6 +629,20 @@ static int Opcode_Gfx2_AlphaToScreenGray(Thread_t* t)
 	return 0;
 }
 
+/* 92 1B (1.640 on; inferred, see BmpOp_MaskFromBitmap): dst, src, mode →
+ * dst becomes a gray mask of src's size (src's alpha for mode 1). */
+static int Opcode_Gfx2_MaskFromBitmap(Thread_t* t)
+{
+	int mode = (int)Thread_Pop(t), src = (int)Thread_Pop(t), dst = (int)Thread_Pop(t);
+	switch(BmpOp_MaskFromBitmap(dst, src, mode))
+	{
+		case 0x80000009u: GFX_ERROR(t, MSG_GEN_DST_INVALID, dst); break;
+		case 0x8000000au: GFX_ERROR(t, MSG_GEN_SRC_INVALID, src); break;
+		default: break;
+	}
+	return 0;
+}
+
 // -------------------------------------------------------------------------
 // 92 F2, 92 F4, 92 F5 : video textures (1.494 on)
 // -------------------------------------------------------------------------
@@ -726,6 +751,7 @@ void Vm_Optable92Init(void)
 		{0xF4, Opcode_Gfx2_VideoTextureControl, GEN_1_547, GEN_LAST},
 		{0xF5, Opcode_Gfx2_VideoTexturePosition, GEN_1_573, GEN_LAST},
 		{0x1A, Opcode_Gfx2_AlphaToScreenGray, GEN_1_494, GEN_LAST},
+		{0x1B, Opcode_Gfx2_MaskFromBitmap, GEN_1_640, GEN_LAST},
 		{0x37, Opcode_Gfx2_ObjSetFixedOffset2, GEN_1_69_472, GEN_1_69_472}, // the other builds have it at "91 36" from 1.494
 		{0x00, Opcode_Gfx2_DefineRipple, GEN_FIRST, GEN_LAST},
 		{0x01, Opcode_Gfx2_DefineRippleEx, GEN_FIRST, GEN_LAST},

@@ -39,10 +39,14 @@ void OS_ShellNotifyAssocChanged(void)
 {
 }
 
-// the shell folders under $HOME: the desktop, the programs menu and the documents; anything else is the home itself
+// the shell folders under $HOME (on Android: under $BGI_FILES_DIR): the desktop, the programs menu and the documents; anything else is the home itself
 int OS_SpecialFolder(int csidl, char* buf, size_t n)
 {
+#ifdef __ANDROID__
+	const char* home = getenv("BGI_FILES_DIR"); // no $HOME on a device
+#else
 	const char* home = getenv("HOME");
+#endif
 	if(!home)
 		home = ".";
 	switch(csidl)

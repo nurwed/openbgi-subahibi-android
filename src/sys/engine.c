@@ -33,6 +33,19 @@
 #include "bgi/msg.h"
 #include "bgi/os.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
+/* The processor checks of Engine_Main ask CPUID for CMOV and MMX: an ARM
+ * (or any other non-x86) host has neither CPUID nor those instructions, so
+ * the gate would turn every start away.  MSVC spells the x86 macros
+ * _M_IX86 / _M_X64.  The WASM build has its own switch (no CPUID on a
+ * page). */
+#if !defined(__i386__) && !defined(__x86_64__) && !defined(_M_IX86) && !defined(_M_X64)
+#define BGI_NO_X86 1
+#endif
+
 int gLauncherMode;                       // "Execute as a launcher.": no sound, no saved window position
 int gNoMutex;                            // "Do not use mutex.": several instances may run
 int gDiscMarker;                         // --disc-marker: "80 34" reports the disc marker file
@@ -217,20 +230,32 @@ int Engine_Init(void)
 	Idle_Init();
 	if(!MainWindow_Create())
 		return 0;
+#if defined(__ANDROID__)
+	AndroidProf_Phase("window created");
+#endif
 	// the original loads the arrow and its resource cursor here; the OS layer's window has them
 	if(!Mem_Init())
 		return 0;
 	SetDisplayMode(2, 1, 0); // the initial mode: size index 2 (800x600), 32-bit pixels, windowed
 	SysArea_Init();
+#if defined(__ANDROID__)
+	AndroidProf_Phase("memory and display mode ready");
+#endif
 	if(!gLauncherMode && !Sound_Init())
 		return 0;
 	DynMem_Init();
 	Engine_DetectVersion();
+#if defined(__ANDROID__)
+	AndroidProf_Phase("engine profile detected");
+#endif
 	Mem_SetSysAreaSize();
 	Display_InitSizeTable(); // the generation's picture sizes (index 2 is 800x600 in all of them)
 	Vm_TablesInit();         // (static data in the original)
 	UserOp_Init();
 	Loader_Start();
+#if defined(__ANDROID__)
+	AndroidProf_Phase("loader started, engine up");
+#endif
 	Child_InitTable();
 	Ptcl_InitGlobals();
 	Blit_InitMmxTables();
@@ -418,10 +443,11 @@ const char* Engine_GamesJsonPath(void)
 }
 
 /* Find and read games.json: --games= / BGI_GAMES name it; otherwise the
- * game directory's own comes first, then the one beside the binary - and
- * when there is none there either, the built-in defaults are written to
- * that place (quietly kept in memory when the directory cannot be
- * written to, as from a read-only location) and used. */
+ * game directory's own comes first, then the one beside the binary (on
+ * Android: the app's files directory, BGI_FILES_DIR) - and when there is
+ * none there either, the built-in defaults are written to that place
+ * (quietly kept in memory when the directory cannot be written to, as from
+ * a read-only location) and used. */
 static void Engine_LoadGames(void)
 {
 	char path[0x408];
@@ -440,12 +466,31 @@ static void Engine_LoadGames(void)
 		snprintf(gGamesPath, sizeof gGamesPath, "%s", path);
 		return;
 	}
+#ifdef __ANDROID__
+	/* the binary sits inside the APK, which has no writable directory
+	 * beside it: the app's files directory (BGI_FILES_DIR) is the second
+	 * place, and where the default file is written */
+	{
+		const char* files = getenv("BGI_FILES_DIR");
+		if(files && *files)
+			snprintf(path, sizeof path, "%s/games.json", files);
+		else
+		{
+			OS_BinaryDir(path, sizeof path);
+			strncat(path, "games.json", sizeof path - strlen(path) - 1);
+		}
+	}
+#else
 	OS_BinaryDir(path, sizeof path);
 	strncat(path, "games.json", sizeof path - strlen(path) - 1);
+#endif
 	snprintf(gGamesPath, sizeof gGamesPath, "%s", path);
 	if(Engine_LoadGamesJson(path))
 		return;
 	Engine_ResetGames(); // a file that failed to parse may have replaced nothing or everything: start clean
+#ifdef __ANDROID__
+	fprintf(stderr, "bgi: android: no games.json in the game directory or in %s: the built-in profiles are used\n", path);
+#endif
 	Engine_SaveGamesJson(path);
 }
 
@@ -462,21 +507,51 @@ static void Engine_DetectVersion(void)
 	uint8_t* buf;
 	uint32_t n = 0;
 	BgiTryFrame_t frame;
+#if defined(__ANDROID__)
+	uint64_t tAlloc0, tAlloc1, tLoad0, tLoad1;
+	tAlloc0 = tAlloc1 = tLoad0 = tLoad1 = 0;
+#endif
 
 	GetBootProgram(arc, file);
-	buf = (uint8_t*)BGI_Alloc(0x2000000); // a 32 MB scratch buffer, as the engine's own file-size probe uses
+#if defined(__ANDROID__)
+	tAlloc0 = AndroidProf_Us();
+#endif
+	buf = (uint8_t*)BGI_Alloc(BGI_LOAD_BUFFER); // the scratch buffer of the engine's own file-size probe
+#if defined(__ANDROID__)
+	tAlloc1 = AndroidProf_Us();
+#endif
 	if(BGI_TRY(frame))
 	{
+#if defined(__ANDROID__)
+		tLoad0 = AndroidProf_Us();
+#endif
 		n = LoadFile(buf, strcmp(arc, ".") == 0 ? NULL : arc, file);
+#if defined(__ANDROID__)
+		tLoad1 = AndroidProf_Us();
+#endif
 		BGI_END_TRY(frame);
 	}
 	else
 	{
+#ifdef __ANDROID__
+		{ // nothing to boot: say which program and directory were tried
+			char dir[0x400];
+			OS_GameDir(dir, sizeof dir);
+			fprintf(stderr, "bgi: android: cannot read the boot program %s%s%s: game directory %s\n",
+				strcmp(arc, ".") == 0 ? "" : arc, strcmp(arc, ".") == 0 ? "" : "/", file, dir);
+		}
+#endif
 		n = 0; // the boot program is missing: the VM reports it properly later
 	}
 	if(n)
 	{ // the game's entry names its profile and its product name; a forced profile replaces the former only
 		const char* prof = Engine_DetectGame(buf, n);
+#if defined(__ANDROID__)
+		AndroidProf_Log("boot program %s%s%s %u B: alloc BGI_LOAD_BUFFER %llu us, read+decode %llu us, total %llu us",
+			strcmp(arc, ".") == 0 ? "" : arc, strcmp(arc, ".") == 0 ? "" : "/", file, n,
+			(unsigned long long)(tAlloc1 - tAlloc0), (unsigned long long)(tLoad1 - tLoad0),
+			(unsigned long long)(tLoad1 - tAlloc0));
+#endif
 		if(prof && !(forced && *forced))
 			fprintf(stderr, "bgi: engine profile %s selected for this game\n", prof);
 		else if(!prof && !(forced && *forced))
@@ -505,6 +580,13 @@ static int Engine_ChooseGame(void)
 	int r;
 	if(!gBootDefault || OS_FileAttrs("system.arc") != OS_INVALID_ATTRS || OS_FileAttrs("ipl._bp") != OS_INVALID_ATTRS)
 		return 1;
+#ifdef __ANDROID__
+	{ // there is no launcher window on a device yet: say which directory was tried and what is missing
+		char dir[0x400];
+		OS_GameDir(dir, sizeof dir);
+		fprintf(stderr, "bgi: android: neither system.arc nor ipl._bp in %s\n", dir);
+	}
+#endif
 	r = Launcher_Run(gGamesPath, profile, sizeof profile, options, sizeof options);
 	if(r < 0)
 	{
@@ -584,6 +666,9 @@ int Engine_Main(const char* cmdLine)
 		if(r <= 0)
 			return r < 0 ? 1 : 0;
 	}
+#if defined(__ANDROID__)
+	AndroidProf_Phase("command line and games.json done");
+#endif
 	if(!gNoMutex)
 	{
 		mutex = OS_InstanceMutexCreate("Buriko General Interpreter for Tayutama is executing.", &exists);
@@ -600,7 +685,7 @@ int Engine_Main(const char* cmdLine)
 			return 0;
 		}
 	}
-#if !defined(BGI_WASM) // no CPUID on a page: the processor checks are skipped there
+#if !defined(BGI_WASM) && !defined(BGI_NO_X86) // no CPUID on a page or off x86: the processor checks are skipped there
 	if(!Cpu_Detect())
 	{
 		OS_MessageBox(MSG_CPU_UNSUPPORTED, "Error!!", OS_MB_ICONHAND | OS_MB_SYSTEMMODAL);
@@ -622,11 +707,20 @@ int Engine_Main(const char* cmdLine)
 	Dbg_Init();
 	if(gOptDebug)
 		Dbg_RequestOpen(gOptDebug == 2);
+#if defined(__ANDROID__)
+	AndroidProf_Phase("Engine_Init begin");
+#endif
 	if(Engine_Init())
 	{
+#if defined(__ANDROID__)
+		AndroidProf_Phase("Engine_Init done, VM begins");
+#endif
 		OS_ImeStatus(0); // no input method while the game runs (ImmAssociateContext / IMC_CLOSESTATUSWINDOW)
 		VmMain();
 		OS_ImeStatus(1);
+#if defined(__ANDROID__)
+		AndroidProf_Phase("VM ended");
+#endif
 	}
 	Dbg_Shutdown();
 	Engine_Shutdown();

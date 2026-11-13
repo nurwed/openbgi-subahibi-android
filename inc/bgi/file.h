@@ -23,6 +23,12 @@
 #ifndef BGI_FILE_H_
 #define BGI_FILE_H_
 
+/* The size of the buffer every file load and decode goes into.  The original
+ * used 32 MB; the 1.643 build of Subarashiki Hibi has pictures whose decoded
+ * form is larger (a Cbg2 sprite overran 32 MB), so it is 128 MB here.  The
+ * memory is only touched as far as the picture needs. */
+#define BGI_LOAD_BUFFER 0x8000000
+
 #include "bgi/common.h"
 #include "bgi/os.h"
 

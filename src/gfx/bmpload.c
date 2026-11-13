@@ -30,7 +30,11 @@
 #include "bgi/version.h"
 #include "bgi/picture.h"
 
-#define LOAD_BUFFER 0x2000000 // 32 MB: the engine's load buffer
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
+#define LOAD_BUFFER BGI_LOAD_BUFFER // the load buffer (inc/bgi/file.h)
 
 /* "90 10": load an image file into a slot.  The loader's cache is consulted
  * first; a Windows BMP is decoded directly, anything else must be a raw
@@ -45,12 +49,18 @@ int BmpOp_LoadFile(int slot, const char* arc, const char* name)
 	uint8_t* buf = (uint8_t*)BGI_Alloc(LOAD_BUFFER);
 	uint32_t size = 0;
 	int r;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us(), t1;
+#endif
 
 	if(!Loader_CacheLookup(buf, &size, arc, name))
 	{
 		size = LoadFile(buf, arc, name);
 		Loader_CacheAdd(arc, name, buf, size);
 	}
+#if defined(__ANDROID__)
+	t1 = AndroidProf_Us();
+#endif
 	if(size == 0)
 	{
 		BGI_Free(buf);
@@ -67,6 +77,11 @@ int BmpOp_LoadFile(int slot, const char* arc, const char* name)
 			default: break; // keeps 0x80000001
 		}
 	}
+#if defined(__ANDROID__)
+	AndroidProf_Log("bmp load slot %d %s/%s %u B: read+decode %llu us, finish %llu us", slot,
+		arc && *arc ? arc : "(base)", name, size, (unsigned long long)(t1 - t0),
+		(unsigned long long)(AndroidProf_Us() - t1));
+#endif
 	BGI_Free(buf);
 	return r;
 }

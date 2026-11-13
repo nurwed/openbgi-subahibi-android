@@ -22,6 +22,10 @@
 #include "bgi/codec.h"
 #include "bgi/sys.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 int BGI_IsDsc(const void* data)
 {
 	return memcmp(data, DSC_MAGIC, 16) == 0;
@@ -191,8 +195,15 @@ uint32_t BGI_DscDecode(const void* src, void* dst)
 {
 	DscNode_t* nodes = (DscNode_t*)BGI_Calloc(sizeof(DscNode_t) * DSC_MAX_NODES);
 	uint32_t n;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+	uint32_t outSize = BGI_DscOutSize(src);
+#endif
 	DscBuildTree(nodes, (const uint8_t*)src);
 	n = DscDecodeStream((uint8_t*)dst, (const uint8_t*)src, nodes);
 	BGI_Free(nodes);
+#if defined(__ANDROID__)
+	AndroidProf_Log("dsc decode %u B in %llu us", outSize, (unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	return n;
 }

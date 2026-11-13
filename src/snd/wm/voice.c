@@ -289,6 +289,10 @@ int Wm_MixRunning(void)
 void Wm_HoldAll(int hold)
 {
 	int i;
+#if defined(__ANDROID__)
+	fprintf(stderr, "snd: android: hold all %d at %u ms\n", hold, (unsigned)OS_TicksMs());
+	fflush(stderr);
+#endif
 	OS_LockEnter(gWmLock);
 	for(i = 0; i < WM_BGM_CHANNELS + WM_SE_SLOTS; i++)
 	{

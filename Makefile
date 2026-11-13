@@ -4,6 +4,7 @@
 # Makefile - builds OpenBGI
 #
 #   make                 native Linux build        -> bin/bgi
+#   make sdl             SDL2 back end              -> bin/bgi-sdl
 #   make win             MinGW cross build          -> bin/bgi.exe
 #   make wasm            Emscripten build           -> bin/wasm/openbgi.html (+ .js, .wasm; docs/wasm.md)
 #   make CC=clang        any other C99 compiler
@@ -17,8 +18,9 @@
 #   make clean
 #
 # Layout: inc/ headers, src/ sources, obj/ objects, bin/ binaries.
-# The OS layer is src/os/os_common.c plus src/os/posix/*.c, src/os/win32/*.c
-# or src/os/wasm/*.c.  Only plain make is used; no autotools / CMake.
+# The OS layer is src/os/os_common.c plus src/os/posix/*.c, src/os/sdl/*.c,
+# src/os/win32/*.c or src/os/wasm/*.c.  Only plain make is used; no
+# autotools / CMake.
 
 CC      ?= gcc
 # the optional libraries are looked up with pkg-config; a cross build uses
@@ -31,13 +33,26 @@ CSTD    := -std=c99
 # names, which are bounded by the formats that produce them)
 WARN    := -Wall -Wextra -pedantic -Wno-unused-parameter \
            -Wno-format-truncation -Wno-format-overflow
-OPT     ?= -O2 -g
+OPT     ?= -O0 -g
 INC     := -Iinc
 CFLAGS  += $(CSTD) $(WARN) $(OPT) $(INC) -D_POSIX_C_SOURCE=200809L
 LDFLAGS +=
 
+# ---- CP932 table ----------------------------------------------------------
+# sjis.c converts through iconv by default; SJIS_TABLE=1 uses the generated
+# CP932 table (src/os/posix/sjis_table.c, tools/gen_sjis_table.py) instead,
+# which is what an Android build does (bionic's iconv is API 28 and has no
+# guaranteed CP932 alias).  The table is compiled only in that build; the
+# normal desktop build still uses iconv.
+SJIS_TABLE ?= 0
+SJIS_TABLE_SRC :=
+ifeq ($(SJIS_TABLE),1)
+  CFLAGS += -DBGI_SJIS_TABLE
+  SJIS_TABLE_SRC := src/os/posix/sjis_table.c
+endif
+
 # ---- platform -------------------------------------------------------------
-# PLATFORM is "posix", "win32" or "wasm"; "make win" selects the MinGW
+# PLATFORM is "posix", "sdl", "win32" or "wasm"; "make win" selects the MinGW
 # toolchain, "make wasm" Emscripten (emcc on the PATH, e.g. from emsdk).
 PLATFORM ?= posix
 ifeq ($(PLATFORM),wasm)
@@ -72,6 +87,27 @@ else ifeq ($(PLATFORM),wasmsim)
   LDLIBS  += -lm
   TARGET  := bin/openbgi-wasmsim
   VORBIS  := none
+else ifeq ($(PLATFORM),sdl)
+  # "make sdl": the SDL2 back end of src/os/sdl/ with the X11-free files of
+  # the POSIX back end (the file system, paths, time, threads, the machine
+  # services, the registry file, the character converters, the pipe
+  # processes and the FreeType fonts) -> bin/bgi-sdl.  SDL does the window,
+  # its input and the presentation; there is no audio device yet (audio.c
+  # runs the mixer against the clock), so ALSA is not linked here.
+  EXE     :=
+  OS_SRC  := $(wildcard src/os/sdl/*.c) \
+             $(addprefix src/os/posix/,process.c paths.c files.c time.c thread.c machine.c \
+                                       registry.c native.c sjis.c pipeproc.c font.c) \
+             $(SJIS_TABLE_SRC)
+  LDLIBS  += $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null || echo -lSDL2) -lfreetype -lpthread -lm
+  CFLAGS  += -DBGI_POSIX $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null) \
+             $(shell $(PKG_CONFIG) --cflags freetype2 2>/dev/null)
+  # fontconfig resolves the face names; without it well-known font files are searched
+  ifneq ($(shell $(PKG_CONFIG) --exists fontconfig 2>/dev/null && echo yes),)
+    CFLAGS += -DBGI_HAVE_FONTCONFIG $(shell $(PKG_CONFIG) --cflags fontconfig)
+    LDLIBS += $(shell $(PKG_CONFIG) --libs fontconfig)
+  endif
+  TARGET  := bin/bgi-sdl$(EXE)
 else ifeq ($(PLATFORM),win32)
   # CROSS is the toolchain prefix; it must not be given a value (not even an
   # empty one) before this line, or "?=" keeps that and the host's gcc builds
@@ -85,7 +121,8 @@ else ifeq ($(PLATFORM),win32)
   LDFLAGS += -mwindows
 else
   EXE     :=
-  OS_SRC  := $(wildcard src/os/posix/*.c)
+  OS_SRC  := $(filter-out src/os/posix/sjis_table.c,$(wildcard src/os/posix/*.c)) \
+             $(SJIS_TABLE_SRC)
   LDLIBS  += -lX11 -lXext -lfreetype -lpthread -lm
   CFLAGS  += -DBGI_POSIX $(shell $(PKG_CONFIG) --cflags freetype2 2>/dev/null)
   # ALSA output when the development files are present; silence otherwise
@@ -149,7 +186,7 @@ LIB_OBJ := $(filter-out obj/$(PLATFORM)/sys/main.o,$(OBJ)) # the engine without 
 
 TARGET ?= bin/bgi$(EXE)
 
-.PHONY: all win wasm wasm-sim tools check check-win check-wasm wasm-test test clean msg
+.PHONY: all sdl win wasm wasm-sim tools check check-win check-wasm wasm-test test clean msg
 
 all: $(TARGET)
 
@@ -169,6 +206,9 @@ bin/bgidump$(EXE): tools/bgidump.c $(LIB_OBJ) | bin
 
 bin/bgipack$(EXE): tools/bgipack.c $(LIB_OBJ) | bin
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_OBJ) $(LDLIBS)
+
+sdl:
+	$(MAKE) PLATFORM=sdl
 
 win:
 	$(MAKE) PLATFORM=win32
@@ -230,7 +270,7 @@ wasm-test:
 	node tools/wasm/selftest.js
 
 # ---- tests ---------------------------------------------------------------------
-TEST_SRC := $(filter-out tests/wasmfs.c tests/win32wide.c,$(wildcard tests/*.c))
+TEST_SRC := $(filter-out tests/wasmfs.c tests/win32wide.c tests/sjis.c,$(wildcard tests/*.c))
 TEST_BIN := $(patsubst tests/%.c,bin/test_%$(EXE),$(TEST_SRC))
 
 bin/test_%$(EXE): tests/%.c $(LIB_OBJ) | bin
@@ -250,8 +290,15 @@ WIN32WIDE_SRC := tests/win32wide.c src/os/win32/wide.c src/os/os_common.c
 bin/test_win32wide$(EXE): $(WIN32WIDE_SRC) inc/bgi/os_win32.h tools/win32stub/windows.h | bin
 	$(CC) $(CFLAGS) -DBGI_WIN32 -fshort-wchar -Itools/win32stub -o $@ $(WIN32WIDE_SRC)
 
+# the generated CP932 table against the iconv code (built apart: it links the
+# iconv sjis.c and sjis_table.c together, so it must not be built with
+# SJIS_TABLE=1)
+SJIS_SRC := tests/sjis.c src/os/posix/sjis.c src/os/posix/sjis_table.c src/os/os_common.c
+bin/test_sjis$(EXE): $(SJIS_SRC) | bin
+	$(CC) $(CFLAGS) -o $@ $(SJIS_SRC) $(LDLIBS)
+
 ifeq ($(PLATFORM),posix)
-TEST_BIN += bin/test_wasmfs$(EXE) bin/test_win32wide$(EXE)
+TEST_BIN += bin/test_wasmfs$(EXE) bin/test_win32wide$(EXE) bin/test_sjis$(EXE)
 endif
 
 test: $(TEST_BIN)

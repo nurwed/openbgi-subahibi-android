@@ -61,6 +61,7 @@ int BmpOp_Blit(int dst, int x, int y, int src, int effect, int level);
  * not GRAY8, 6 sizes differ, 7 no overlap, 8 bad level */
 int BmpOp_BlitMask(int dst, int x, int y, int src, int gray, int param, int level);
 uint32_t BmpOp_AlphaToScreenGray(int dst, int src, int src2, int x, int y, int ratio); // 1.494 on, "92 1A": the alpha of src as a gray bitmap
+uint32_t BmpOp_MaskFromBitmap(int dst, int src, int mode); // 1.640 on, "92 1B" (inferred, see bmpops.c): src's alpha (mode 1) or luminance as a GRAY8 map of src's size
 /* 1.616 on, the tone curves (src/gfx/tonecurve.c).  "90 CC": register
  * curve `id` from six words (the via point x, y of the R, G and B
  * curves), or remove it with a NULL `points`: 0 ok, 0x16 a point out of

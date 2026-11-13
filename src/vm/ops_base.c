@@ -30,6 +30,9 @@
 #include "bgi/gfx/bmpops.h"
 #include "bgi/os.h"
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // ---- push immediates --------------------------------------------------------
 
@@ -1210,19 +1213,138 @@ VmHandler_t vm_optable_D0[256]; // "D0 xx", 1.535 on: the evaluation instruction
 VmHandler_t vm_optable_E0[256]; // "E0 xx", 1.588 on (its own table from 1.653)
 VmHandler_t vm_optable_EF[256]; // "EF xx": the OpenBGI extensions, a byte no original build uses (ops_obgi.c)
 
+/* ---- lenient handling of unknown family instructions ----------------------
+ *
+ * A "xx yy" family instruction whose table entry is NULL (the engine profile
+ * does not define it) or Opcode_NotImplemented (defined, but no handler) used
+ * to end the script with a script error.  By default it is now logged once
+ * to stderr and skipped: the VM pops the arguments the instruction is known
+ * (or guessed) to take, pushes a dummy result and goes on.
+ *
+ * Set the environment variable OPENBGI_STRICT_OPS=1 to get the old behaviour
+ * (the script error) back, e.g. when hunting for a wrong engine profile.
+ *
+ * A family instruction has no operands in the code stream (only the
+ * sub-opcode byte), so skipping it cannot desynchronise the code; only the
+ * data stack can go out of step.  That is what kStubFx below is for: add a
+ * line for every opcode whose real stack effect you learn from the log.
+ * An opcode not listed there pops nothing and pushes nothing.
+ *
+ * The one-byte main table is NOT covered: an unknown one-byte instruction
+ * may carry inline operands of unknown length, so it stays a script error.
+ */
+
+typedef struct
+{
+	uint8_t fam;    // first opcode byte (0x80 ..)
+	uint8_t sub;    // second opcode byte
+	uint8_t pops;   // values the real instruction pops
+	uint8_t pushes; // values it pushes (all get `result`)
+	uint8_t result; // the dummy value: 0 for "code" results (0 = ok), 1 for "ok"/flag results
+} StubFx_t;
+
+/* Stack effects of the "80 xx" instructions that exist only from some build
+ * on, taken from the signature comments in ops_sys.c.  They are the ones an
+ * older engine profile reports as undefined. */
+static const StubFx_t kStubFx[] = {
+	{0x80, 0x05, 1, 1, 1}, // PerfCounter         out → ok
+	{0x80, 0x06, 1, 0, 0}, // ProfileEnable       on →
+	{0x80, 0x07, 2, 0, 0}, // ProfileQuery        out, mode →
+	{0x80, 0x27, 2, 1, 1}, // MoveFile            newPath, existing → ok
+	{0x80, 0x2B, 5, 1, 1}, // SplitPath           drive, dir, fname, ext, path → ok
+	{0x80, 0x39, 1, 1, 1}, // SetAltDir           dir → ok
+	{0x80, 0x4C, 4, 1, 0}, // ThreadNotify        id, a, b, c → r
+	{0x80, 0x52, 1, 0, 0}, // SetIdleSleep        ms →            (the $8052 of Subarashiki Hibi)
+	{0x80, 0x53, 0, 0, 0}, // SeqDeferDecode      (no stack effect)
+	{0x80, 0x63, 1, 0, 0}, // SetWindowPosMode    v →
+	{0x80, 0x64, 1, 0, 0}, // ShowWindow          f →
+	{0x80, 0x6E, 1, 0, 0}, // SetVsyncWait        on →
+	{0x80, 0x9E, 3, 1, 0}, // RingRemove          id, idx, count → code
+	{0x80, 0xAF, 1, 1, 1}, // SetPanelPollMode    mode → ok
+	{0x80, 0xDA, 3, 1, 1}, // StrtabSetAll        id, count, strs → ok
+	{0x80, 0xDB, 2, 1, 0}, // StrtabGather        buf, id → bytes
+	{0x80, 0xDC, 2, 1, 0}, // StrtabAddIdx        id, str → idx
+	{0x80, 0xDE, 3, 1, 0}, // StrtabLength        outLen, id, idx → code
+	{0x80, 0xE9, 2, 1, 1}, // HashFile            out, path → ok
+	{0x80, 0xEC, 2, 1, 0}, // PluginLoad          out, name → code
+	{0x80, 0xED, 1, 1, 0}, // PluginFree          id → code
+	{0x80, 0xEE, 6, 1, 0}, // PluginCall          out, id, no, b, a, kinds → code
+	{0x91, 0x0A, 2, 0, 0},
+	{0x92, 0x1B, 3, 0, 0},
+	/* the "81 xx", "7F xx", "D0 xx", "E0 xx" families (ops_sys81.c etc.) are
+	 * not known here: add lines as {0x81, 0xNN, pops, pushes, result} */
+};
+
+// the OPENBGI_STRICT_OPS switch, read once
+static int Vm_StrictOps(void)
+{
+	static int strict = -1;
+	if(strict < 0)
+	{
+		const char* e = getenv("OPENBGI_STRICT_OPS");
+		strict = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return strict;
+}
+
+/* the common stub: log (once per opcode), pop what the instruction takes,
+ * push a dummy result, continue.  Called from the dispatcher with the IP
+ * already past the sub-opcode byte; Thread_CurOpIP still names the first byte. */
+static int Vm_StubFamilyOp(Thread_t* t, const char* why)
+{
+	static uint8_t seen[0x10000 / 8];
+	uint32_t ip = Thread_CurOpIP(t);
+	uint8_t fam = t->code[ip];
+	uint8_t sub = t->code[ip + 1];
+	uint32_t key = ((uint32_t)fam << 8) | sub;
+	StubFx_t fx = {fam, sub, 0, 0, 0};
+	size_t i;
+	unsigned n;
+
+	for(i = 0; i < BGI_COUNTOF(kStubFx); i++)
+	{
+		if(kStubFx[i].fam == fam && kStubFx[i].sub == sub)
+		{
+			fx = kStubFx[i];
+			break;
+		}
+	}
+	if(!(seen[key >> 3] & (1u << (key & 7))))
+	{
+		seen[key >> 3] |= (uint8_t)(1u << (key & 7));
+		fprintf(stderr,
+			"[BGI-VM] WARNING: %s instruction $%02X%02X (engine %s, ip=0x%X) stubbed: "
+			"pop %u, push %u (dummy %u)%s\n",
+			why, fam, sub, gEngine->name, (unsigned)ip, (unsigned)fx.pops, (unsigned)fx.pushes,
+			(unsigned)fx.result, i == BGI_COUNTOF(kStubFx) ? " [stack effect UNKNOWN, add it to kStubFx]" : "");
+	}
+	for(n = 0; n < fx.pops; n++)
+		Thread_Pop(t);
+	for(n = 0; n < fx.pushes; n++)
+		Thread_Push(t, fx.result);
+	return 0;
+}
+
 /* read the second opcode byte and dispatch through the family table; a
- * sub-opcode without a handler raises the family's "undefined instruction"
- * script error (`errFmt` takes the byte) */
+ * sub-opcode without a handler (or with only the not-implemented stand-in)
+ * is skipped by Vm_StubFamilyOp, or, with OPENBGI_STRICT_OPS set, raises the
+ * family's "undefined instruction" script error (`errFmt` takes the byte) */
 static int Dispatch(Thread_t* t, VmHandler_t* table, const char* errFmt)
 {
 	uint8_t sub = RdU8(t);
-	if(!table[sub])
+	VmHandler_t fn = table[sub];
+	if(!fn || fn == Opcode_NotImplemented)
 	{
-		char msg[0x100];
-		sprintf(msg, errFmt, sub);
-		ScriptError(msg, t);
+		if(!Vm_StrictOps())
+			return Vm_StubFamilyOp(t, fn ? "unimplemented" : "undefined");
+		if(!fn)
+		{
+			char msg[0x100];
+			sprintf(msg, errFmt, sub);
+			ScriptError(msg, t);
+		}
 	}
-	return table[sub](t);
+	return fn(t);
 }
 
 // the dispatchers of the two-byte families; each reads the sub-opcode and runs its handler

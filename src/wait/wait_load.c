@@ -31,6 +31,10 @@
 #include "bgi/gfx/bmpops.h"
 #include "bgi/gfx/bmseq.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 typedef struct WaitLoader // 0x238 bytes
 {
 	Wait_t w;         // (WaitCounted)
@@ -40,6 +44,9 @@ typedef struct WaitLoader // 0x238 bytes
 	uint32_t status;  // loader status: 0 pending, -1 failed, else the size in bytes
 	int useCache;     // the file cache is consulted / fed
 	int cacheHit;     // the lookup succeeded (nothing was queued)
+#if defined(__ANDROID__)
+	uint64_t tAllocUs; // profiler: when BGI_LOAD_BUFFER was allocated
+#endif
 } WaitLoader_t;
 
 typedef struct WaitBmpLoad // 0x23c bytes
@@ -91,7 +98,12 @@ static void WaitLoader_Ctor(WaitLoader_t* w, Thread_t* t, const char* arc, const
 	strcpy(w->name, name);
 	SjisStrLwr(w->name);
 	w->useCache = useCache && gFileCache != NULL;
-	w->buf = (uint8_t*)BGI_Alloc(0x2000000);
+	w->buf = (uint8_t*)BGI_Alloc(BGI_LOAD_BUFFER);
+#if defined(__ANDROID__)
+	w->tAllocUs = AndroidProf_Us();
+	AndroidProf_Log("loadbuf %u B for %s/%s, not zeroed", (unsigned)BGI_LOAD_BUFFER, w->arc[0] ? w->arc : "(base)",
+		w->name);
+#endif
 	if(w->useCache)
 	{
 		w->cacheHit = FileCache_Lookup(gFileCache, w->buf, &w->status, ARC_ARG(w), w->name) != 0;
@@ -120,6 +132,14 @@ static int WaitLoader_Poll(Wait_t* base)
 	Wait_Tick(base);
 	if(w->status == 0)
 		return 0;
+#if defined(__ANDROID__)
+	if(w->status == 0xffffffffu)
+		AndroidProf_Err("loadbuf read FAIL %s/%s after %llu ms", w->arc[0] ? w->arc : "(base)", w->name,
+			(unsigned long long)((AndroidProf_Us() - w->tAllocUs) / 1000));
+	else
+		AndroidProf_Log("loadbuf read %s/%s %u B after %llu ms (cache %d)", w->arc[0] ? w->arc : "(base)", w->name,
+			w->status, (unsigned long long)((AndroidProf_Us() - w->tAllocUs) / 1000), w->cacheHit);
+#endif
 	if(w->status == 0xffffffffu)
 		return -1;
 	if(w->useCache && !w->cacheHit)
@@ -143,6 +163,9 @@ static int WaitBmpLoad_Finish(WaitLoader_t* l)
 	WaitBmpLoad_t* w = (WaitBmpLoad_t*)l;
 	Thread_t* t = l->w.thread;
 	char msg[0x100];
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 	switch(BmpOp_DecodeBmp(w->bmpNo, l->buf))
 	{
 		case(int)0x80000001: // not a BMP
@@ -178,6 +201,10 @@ static int WaitBmpLoad_Finish(WaitLoader_t* l)
 			break;
 		default: break; // 0 and 0x80000007 (the manager refused) pass silently
 	}
+#if defined(__ANDROID__)
+	AndroidProf_Log("bmp %d finish %s/%s %u B in %llu us", w->bmpNo, l->arc[0] ? l->arc : "(base)", l->name, l->status,
+		(unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	return 1;
 }
 

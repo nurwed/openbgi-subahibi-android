@@ -143,6 +143,40 @@ uint32_t BmpOp_AlphaToScreenGray(int dst, int src, int src2, int x, int y, int r
 	return 0;
 }
 
+/* "92 1B" (1.640 on): dst, src, mode.  INFERRED, not taken from the original
+ * engine: it sits between "92 1A" (the alpha of src as a gray map) and the
+ * other gray derivations, and Subarashiki Hibi's backlog window (logwnd._bp)
+ * calls it as (1431, p8, 1), then reads the size of 1431 with bmp_info and
+ * makes a 32-bit bitmap of that size, and a failed 1431 later stops with
+ * "the specified source bitmap [1431] is invalid".  So: dst becomes a new
+ * GRAY8 bitmap of src's size holding the alpha of a 32-bit src for mode 1
+ * (255 everywhere when src has no alpha), or its luminance for any other
+ * mode (BmpMgr_ToGray).  0 ok, 0x80000009 dst cannot be made, 0x8000000a
+ * src unknown. */
+uint32_t BmpOp_MaskFromBitmap(int dst, int src, int mode)
+{
+	Bmp_t s, d;
+	int yy, xx;
+	if(!BmpMgr_GetInfo(gBmpMgr, &s, src))
+		return 0x8000000au;
+	if(mode != 1)
+		return BmpMgr_ToGray(gBmpMgr, dst, src) == 0 ? 0 : 0x80000009u;
+	if(dst == src)
+		return 0x80000009u; // would free the pixels being read
+	if(!BmpMgr_Create(gBmpMgr, dst, s.w, s.h, 3))
+		return 0x80000009u;
+	if(!BmpMgr_GetInfo(gBmpMgr, &d, dst))
+		return 0x80000009u;
+	for(yy = 0; yy < s.h; yy++)
+	{
+		const uint8_t* sp = s.pixels + (size_t)yy * (size_t)s.pitch + 3;
+		uint8_t* dp = d.pixels + (size_t)yy * (size_t)d.pitch;
+		for(xx = 0; xx < s.w; xx++, sp += 4, dp++)
+			*dp = s.mode == 2 ? *sp : 0xff;
+	}
+	return 0;
+}
+
 /* "90 19": Blit_ThroughGray of src at (x, y) of dst through the gray map
  * in slot `gray`.  0 ok, 1 / 2 / 3 no destination / source / gray; the
  * blitter's codes renumbered: 4 modes differ, 5 gray not GRAY8, 6 gray

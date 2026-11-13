@@ -19,10 +19,22 @@
 #include "bgi/os_common.h"
 #include "bgi/os_posix.h"
 
+/* CP932 <-> UTF-8: bionic only has iconv from API 28 on and its CP932 alias
+ * is not guaranteed, so Android - and a desktop build with SJIS_TABLE=1 -
+ * uses the generated table of sjis_table.c instead (tools/gen_sjis_table.py);
+ * every other build keeps iconv. */
+#if defined(__ANDROID__) || defined(BGI_SJIS_TABLE)
+#define BGI_SJIS_TABLE_BUILTIN 1
+#else
+#define BGI_SJIS_TABLE_BUILTIN 0
+#endif
+
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#if !BGI_SJIS_TABLE_BUILTIN
 #include <iconv.h>
+#endif
 #include <pthread.h>
 #include <pwd.h>
 #include <sched.h>
@@ -52,5 +64,11 @@ extern char gPosixRegFile[PATH_MAX];   // the registry emulation's file (registr
 
 void OsPosix_SjisInit(void);     // open the CP932 converters (sjis.c)
 void OsPosix_SjisShutdown(void); // close them
+
+#if defined(__ANDROID__)
+// the directory listing cache of paths.c: a write in a directory drops its cached listing
+void OsPosix_PathCacheDrop(const char* posixDir);
+void OsPosix_PathCacheDropPath(const char* posixPath);
+#endif
 
 #endif

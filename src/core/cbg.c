@@ -23,6 +23,10 @@
  */
 #include "bgi/codec.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 int BGI_IsCbg(const void* data)
 {
 	return memcmp(data, CBG_MAGIC, 16) == 0;
@@ -241,6 +245,9 @@ uint32_t BGI_CbgDecode(const void* src, void* dst)
 	uint32_t weights[256];
 	CbgNode_t* nodes;
 	int root;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 
 	if(!BGI_IsCbg(src))
 		return 0x80000003u;
@@ -274,5 +281,9 @@ uint32_t BGI_CbgDecode(const void* src, void* dst)
 
 	CbgUnfilter(d + 0x10, (const RawImageHeader_t*)d);
 	BGI_Free(table);
+#if defined(__ANDROID__)
+	AndroidProf_Log("cbg1 decode %ux%u bpp %u enc %u inter %u in %llu us", h->width, h->height, h->bpp & 0xffffu,
+		h->encLen, h->interLen, (unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	return 0;
 }

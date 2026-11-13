@@ -35,6 +35,10 @@
  */
 #include "bgi/codec.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 #define DC_SYMBOLS 16
 #define AC_SYMBOLS 176
 
@@ -436,6 +440,9 @@ uint32_t Cbg2_Decode(const void* src, void* dst)
 	int dcRoot, acRoot;
 	int16_t* coef;
 	uint8_t* buf;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 
 	if(h->encLen < 128) // the two quantisation tables must be there
 		return 0x80000003u;
@@ -549,5 +556,9 @@ uint32_t Cbg2_Decode(const void* src, void* dst)
 	BGI_Free(buf);
 	BGI_Free(acNodes);
 	BGI_Free(dcNodes);
+#if defined(__ANDROID__)
+	AndroidProf_Log("cbg2 decode %ux%u bpp %u buf %u B (zeroed) enc %u in %llu us", w, hgt, bpp, bufLen, h->encLen,
+		(unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	return 0;
 }

@@ -15,6 +15,8 @@
  * back through the 0x100-byte buffers of os.h only when the dialog was
  * confirmed (button id 1).
  */
+#define _XOPEN_SOURCE 700
+
 #include "ui_internal.h"
 
 #include <dirent.h>

@@ -22,6 +22,11 @@
  * 30 and the length as unknown.  The movie is over when both pipes have
  * ended and everything read was shown or heard; Movie_OnEvent then does
  * what the DirectShow EC_COMPLETE did.
+ *
+ * Android decodes in process instead (inc/bgi/plmarc.h, src/sys/plmarc.c):
+ * one thread fills the same frame and sample rings from pl_mpeg, which also
+ * skips the 144-byte ARC20 header.  The video clock stays the master, the
+ * sound is resampled to the mixer's rate and mixed the same way.
  */
 #include "bgi/gfx.h"
 #include "bgi/display.h"
@@ -30,10 +35,16 @@
 
 #include <math.h>
 
+#if defined(__ANDROID__)
+#include <time.h>
+#include "bgi/plmarc.h"
+#endif
+
 #define FX_FRAMES      4                   // frames in the ring
 #define FX_AUDIO_RATE  44100               // the mixer's rate (WM_MIX_RATE)
 #define FX_RING_FRAMES (FX_AUDIO_RATE * 2) // two seconds of sound
 #define FX_CMD_MAX     0x400
+#define FX_LEAD        0.20                // Android: audio decoded this far ahead of the picture
 
 typedef struct MovieFx
 {
@@ -56,11 +67,26 @@ typedef struct MovieFx
 	int32_t shown;                  // index of the frame shown last, -1 for none
 	volatile int32_t gain16;        // the volume as a 16.16 gain, read by the mixer's thread
 	int hasAudio;                   // the sound track is mixed
+#if defined(__ANDROID__)
+	// the in-process decoder: no child processes, one thread for both streams
+	PlmArc_t* arc;
+	OsThread_t* thread;
+	char name[0x100];          // the path the script gave, for the line logged at the end
+	uint32_t decodeNs;         // PlmArc_DecodeVideo + PlmArc_ConvertBgra, every frame
+	double worstDecodeMs;
+	volatile int32_t aDropped; // resampled frames the full ring refused
+	float prevL, prevR;        // the resampler's previous source frame
+	uint32_t aPhase;           // 16.16 position between prev and the current source frame
+	uint32_t aStep;            // source frames per output frame, 16.16
+	int aPrimed;
+#endif
 } MovieFx_t;
 
 static MovieFx_t* gFx; // the running movie, NULL for none
 
 // ---- the decoder threads -----------------------------------------------------------------------
+
+#if !defined(__ANDROID__)
 
 static int ReadFully(OsPipeProc_t* p, uint8_t* buf, int n, volatile int* stop)
 {
@@ -121,6 +147,119 @@ static void AudioThread(void* arg)
 	fx->aEnd = 1;
 }
 
+#else // __ANDROID__: one thread decodes both streams through pl_mpeg
+
+static uint64_t FxNs(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+static int16_t FxSample(float v)
+{
+	if(v > 1.0f)
+		v = 1.0f;
+	else if(v < -1.0f)
+		v = -1.0f;
+	return (int16_t)(v * 32767.0f);
+}
+
+/* Convert the stream's float frames to the mixer's 16-bit 44.1 kHz ring by
+ * linear interpolation.  The previous frame is kept for block boundaries; a
+ * sample that finds the ring full is dropped and counted. */
+static void Resample(MovieFx_t* fx, const float* in, unsigned count)
+{
+	unsigned i;
+	for(i = 0; i < count; i++)
+	{
+		float l = in[i * 2], r = in[i * 2 + 1];
+		if(!fx->aPrimed)
+		{
+			fx->prevL = l;
+			fx->prevR = r;
+			fx->aPrimed = 1;
+			continue;
+		}
+		while(fx->aPhase < 0x10000u)
+		{
+			float t = (float)fx->aPhase * (1.0f / 65536.0f);
+			if(fx->aWrite - fx->aRead >= FX_RING_FRAMES)
+				fx->aDropped++;
+			else
+			{
+				int slot = fx->aWrite % FX_RING_FRAMES;
+				fx->ring[(size_t)slot * 2] = FxSample(fx->prevL + (l - fx->prevL) * t);
+				fx->ring[(size_t)slot * 2 + 1] = FxSample(fx->prevR + (r - fx->prevR) * t);
+				fx->aWrite++;
+			}
+			fx->aPhase += fx->aStep;
+		}
+		fx->aPhase -= 0x10000u;
+		fx->prevL = l;
+		fx->prevR = r;
+	}
+}
+
+/* Decode one picture when the frame ring has room, then the sound up to
+ * FX_LEAD past the picture.  The video clock is the master; both rings full
+ * means a 2 ms sleep, which lets a skip leave quickly. */
+static void DecodeThread(void* arg)
+{
+	MovieFx_t* fx = (MovieFx_t*)arg;
+	while(!fx->stop)
+	{
+		int did = 0;
+		if(!fx->vEnd && fx->vWrite - fx->vRead < FX_FRAMES)
+		{
+			uint64_t t0 = FxNs(), t1;
+			int ok = PlmArc_DecodeVideo(fx->arc);
+			if(ok)
+				PlmArc_ConvertBgra(fx->arc, fx->frame[fx->vWrite % FX_FRAMES], fx->w * 4);
+			t1 = FxNs();
+			if(ok)
+			{
+				double ms = (double)(t1 - t0) / 1e6;
+				if(ms > fx->worstDecodeMs)
+					fx->worstDecodeMs = ms;
+				fx->decodeNs += (uint32_t)(t1 - t0);
+				fx->vWrite++;
+				did = 1;
+			}
+			else
+				fx->vEnd = 1;
+		}
+		if(fx->hasAudio && !fx->aEnd)
+		{
+			/* up to the picture plus the lead; once the picture has ended,
+			 * the rest of the track, so that aEnd is reached and the movie
+			 * can finish (the ffmpeg pipe ended the same way) */
+			while(!fx->stop &&
+				(fx->vEnd || PlmArc_AudioTime(fx->arc) < PlmArc_VideoTime(fx->arc) + FX_LEAD))
+			{
+				unsigned count = 0;
+				const float* s;
+				if(FX_RING_FRAMES - (fx->aWrite - fx->aRead) < 4096)
+					break; // nearly full: let the mixer catch up (did stays 0, so we sleep)
+				s = PlmArc_DecodeAudio(fx->arc, &count);
+				if(!s)
+				{
+					fx->aEnd = 1;
+					break;
+				}
+				Resample(fx, s, count);
+				did = 1;
+			}
+		}
+		if(!did)
+			OS_SleepMs(2);
+	}
+	fx->vEnd = 1;
+	fx->aEnd = 1;
+}
+
+#endif // __ANDROID__
+
 // the external mix: the ring's samples, scaled by the gain, into the accumulators (silence when the ring is empty)
 static void MixTap(void* user, int32_t* acc, int frames)
 {
@@ -143,6 +282,8 @@ static void MixTap(void* user, int32_t* acc, int frames)
 }
 
 // ---- probing -----------------------------------------------------------------------------------
+
+#if !defined(__ANDROID__) // Android reads the rate and the length from pl_mpeg itself
 
 /* ffprobe: the frame rate and the length (lengthMs 0 when unknown).  The
  * output is "key=value" lines; a missing ffprobe leaves the defaults. */
@@ -186,6 +327,8 @@ static void Probe(const char* native, double* fps, int32_t* lengthMs)
 	}
 }
 
+#endif // !__ANDROID__
+
 // ---- the player --------------------------------------------------------------------------------
 
 static int32_t GainOf(int32_t volume) // IBasicAudio hundredths of a decibel (-10000 .. 0) as a 16.16 factor
@@ -196,6 +339,33 @@ static int32_t GainOf(int32_t volume) // IBasicAudio hundredths of a decibel (-1
 		return 0x10000;
 	return (int32_t)(pow(10.0, volume / 2000.0) * 65536.0);
 }
+
+#if defined(__ANDROID__)
+
+static void Release(MovieFx_t* fx)
+{
+	int i;
+	int32_t produced = fx->vWrite, dropped;
+	fx->stop = 1;
+	if(fx->hasAudio)
+		Wm_SetExternalMix(NULL, NULL); // the mixer's thread no longer reads the ring
+	OS_ThreadJoin(fx->thread);         // the decoder leaves within a couple of milliseconds
+	PlmArc_Close(fx->arc);
+	dropped = produced - (fx->shown + 1); // produced but never presented: the clock passed them
+	if(dropped < 0)
+		dropped = 0;
+	fprintf(stderr,
+		"movie: %s: %d frames decoded, %d dropped, %.2f ms average decode (%.2f ms worst), %.2f s of stream, %d audio frames dropped\n",
+		fx->name, (int)produced, (int)dropped, produced > 0 ? (double)fx->decodeNs / 1e6 / produced : 0.0,
+		fx->worstDecodeMs, fx->fps > 0.0 ? produced / fx->fps : 0.0, (int)fx->aDropped);
+	fflush(stderr);
+	for(i = 0; i < FX_FRAMES; i++)
+		free(fx->frame[i]);
+	free(fx->ring);
+	free(fx);
+}
+
+#else
 
 static void Release(MovieFx_t* fx)
 {
@@ -213,11 +383,110 @@ static void Release(MovieFx_t* fx)
 	free(fx);
 }
 
+#endif
+
 /* Start `path` (an engine path) in the picture rectangle (x, y, w, h)
  * at `volume`; *lengthMs receives the length ffprobe reports (0
  * unknown).  1 when ffmpeg is running on the file, 0 when it could not
  * be started (ffmpeg missing, or the file unreadable).  An earlier movie
  * is stopped first. */
+#if defined(__ANDROID__)
+
+/* Same contract; the file is decoded in process at the stream's own size.
+ * A stream of another size than the script's rectangle is played unscaled
+ * and logged once. */
+int MovieFx_Start(const char* path, int x, int y, int w, int h, int32_t volume, int32_t* lengthMs)
+{
+	MovieFx_t* fx;
+	char native[0x400];
+	int i;
+
+	MovieFx_Stop();
+	if(w <= 0 || h <= 0 || (size_t)w * (size_t)h > 0x1000000u || OS_FileAttrs(path) == OS_INVALID_ATTRS)
+		return 0;
+	OS_PathNative(path, native, sizeof native);
+	fx = (MovieFx_t*)calloc(1, sizeof *fx);
+	fx->x = x;
+	fx->y = y;
+	fx->w = w;
+	fx->h = h;
+	fx->shown = -1;
+	fx->gain16 = GainOf(volume);
+	snprintf(fx->name, sizeof fx->name, "%s", path);
+	fx->arc = PlmArc_Open(native);
+	if(!fx->arc)
+	{
+		static int said; // once per run: the file is not an MPEG-PS stream, or not readable
+		if(!said++)
+			fprintf(stderr, "movie: \"%s\" cannot be opened: the movie is skipped\n", native);
+		free(fx);
+		return 0;
+	}
+	fx->fps = PlmArc_Fps(fx->arc);
+	if(fx->fps < 1.0 || fx->fps > 240.0)
+		fx->fps = 30.0;
+	fx->lengthMs = (int32_t)PlmArc_LengthMs(fx->arc);
+	if(PlmArc_Width(fx->arc) != w || PlmArc_Height(fx->arc) != h)
+	{
+		static int sized;
+		if(!sized++)
+			fprintf(stderr, "movie: the stream is %dx%d, the script asked for %dx%d: playing it unscaled\n",
+				PlmArc_Width(fx->arc), PlmArc_Height(fx->arc), w, h);
+		fx->w = PlmArc_Width(fx->arc);
+		fx->h = PlmArc_Height(fx->arc);
+	}
+	if((size_t)fx->w * (size_t)fx->h > 0x1000000u)
+	{
+		fprintf(stderr, "movie: \"%s\" is %dx%d, too large: the movie is skipped\n", native, fx->w, fx->h);
+		PlmArc_Close(fx->arc);
+		free(fx);
+		return 0;
+	}
+	for(i = 0; i < FX_FRAMES; i++)
+	{
+		fx->frame[i] = (uint8_t*)malloc((size_t)fx->w * (size_t)fx->h * 4);
+		if(!fx->frame[i])
+			break;
+	}
+	if(Wm_MixRunning() && PlmArc_HasAudio(fx->arc))
+	{
+		fx->ring = (int16_t*)calloc((size_t)FX_RING_FRAMES * 2, sizeof(int16_t));
+		fx->aStep = (uint32_t)(((uint64_t)(unsigned)PlmArc_SampleRate(fx->arc) << 16) / FX_AUDIO_RATE);
+		if(!fx->aStep)
+			fx->aStep = 0x10000; // an unreadable rate: take the stream as 44.1 kHz
+		fx->hasAudio = 1;
+	}
+	if(!fx->hasAudio)
+		fx->aEnd = 1;
+	if(i < FX_FRAMES || (fx->hasAudio && !fx->ring))
+	{ // out of memory: the thread must not see a missing slot
+		fprintf(stderr, "movie: \"%s\": out of memory for the frames: the movie is skipped\n", native);
+		PlmArc_Close(fx->arc);
+		for(i = 0; i < FX_FRAMES; i++)
+			free(fx->frame[i]);
+		free(fx->ring);
+		free(fx);
+		return 0;
+	}
+	fx->thread = OS_ThreadStart(DecodeThread, fx, 0);
+	if(!fx->thread)
+	{
+		PlmArc_Close(fx->arc);
+		for(i = 0; i < FX_FRAMES; i++)
+			free(fx->frame[i]);
+		free(fx->ring);
+		free(fx);
+		return 0;
+	}
+	if(fx->hasAudio)
+		Wm_SetExternalMix(MixTap, fx);
+	gFx = fx;
+	*lengthMs = fx->lengthMs;
+	return 1;
+}
+
+#else
+
 int MovieFx_Start(const char* path, int x, int y, int w, int h, int32_t volume, int32_t* lengthMs)
 {
 	MovieFx_t* fx;
@@ -274,6 +543,8 @@ int MovieFx_Start(const char* path, int x, int y, int w, int h, int32_t volume, 
 	*lengthMs = fx->lengthMs;
 	return 1;
 }
+
+#endif // __ANDROID__
 
 void MovieFx_Stop(void)
 {

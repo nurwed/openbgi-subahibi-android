@@ -14,8 +14,29 @@
  * asks iconv once per code and remembers the answer.  Without the
  * converters (iconv_open failed) every two-byte code is U+FFFD and no
  * code point beyond ASCII has a Shift-JIS form.
+ *
+ * A build without iconv - Android, or the desktop with SJIS_TABLE=1 -
+ * uses the CP932 table that tools/gen_sjis_table.py generates
+ * (sjis_table.c) instead; the behaviour is the same, the table is what the
+ * code page 932 the engine was written for really contains.
  */
 #include "posix_internal.h"
+
+#if BGI_SJIS_TABLE_BUILTIN
+
+// the generated table (sjis_table.c): code <-> Unicode, no iconv
+uint32_t SjisTable_ToUnicode(uint16_t code);
+int SjisTable_FromUnicode(uint32_t cp, char out[2]);
+
+void OsPosix_SjisInit(void)
+{
+}
+
+void OsPosix_SjisShutdown(void)
+{
+}
+
+#else
 
 static iconv_t gSjisToUtf8 = (iconv_t)-1; // the CP932 -> UTF-8 converter, (iconv_t)-1 when not open
 static iconv_t gUtf8ToSjis = (iconv_t)-1; // and the reverse one
@@ -39,9 +60,14 @@ void OsPosix_SjisShutdown(void)
 	gUtf8ToSjis = (iconv_t)-1;
 }
 
+#endif
+
 // the code point of a two-byte code from the table, converting it on the first request; 0xfffd when unmapped
 static uint32_t SjisLookup(uint16_t code)
 {
+#if BGI_SJIS_TABLE_BUILTIN
+	return SjisTable_ToUnicode(code);
+#else
 	if(gSjisTable[code] == 0 && gSjisToUtf8 != (iconv_t)-1)
 	{
 		char in[2] = {(char)(code >> 8), (char)code};
@@ -68,6 +94,7 @@ static uint32_t SjisLookup(uint16_t code)
 			gSjisTable[code] = 0xfffd;
 	}
 	return gSjisTable[code] ? gSjisTable[code] : 0xfffd;
+#endif
 }
 
 uint32_t OsPosix_SjisChar(uint16_t code)
@@ -118,6 +145,14 @@ size_t OS_SjisToUtf8(const char* sjis, char* out, size_t n)
  * code (or the code point is outside the BMP, or there is no converter) */
 int OsPosix_UnicodeToSjis(uint32_t cp, char out[2])
 {
+#if BGI_SJIS_TABLE_BUILTIN
+	if(cp < 0x80)
+	{
+		out[0] = (char)cp;
+		return 1;
+	}
+	return SjisTable_FromUnicode(cp, out);
+#else
 	char in[4];
 	char* ip = in;
 	char* op = out;
@@ -148,4 +183,5 @@ int OsPosix_UnicodeToSjis(uint32_t cp, char out[2])
 	if(iconv(gUtf8ToSjis, &ip, &il, &op, &ol) == (size_t)-1 || il != 0)
 		return 0;
 	return (int)(2 - ol); // the bytes it took of the two available
+#endif
 }

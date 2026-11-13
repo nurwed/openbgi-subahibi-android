@@ -13,9 +13,16 @@
  * the lock files that stand in for the named mutexes.  The binary's own
  * directory (OS_BinaryDir, where games.json lives) is found through
  * /proc/self/exe or the program name.
+ *
+ * Android has neither of those conveniences: $BGI_FILES_DIR names a
+ * writable directory of the app ($BGI_FILES_DIR/.config/bgi holds the
+ * registry and the lock files) and $BGI_GAME_DIR the folder the user picked
+ * for the game, which becomes the game directory at start-up.
  */
+#define _POSIX_C_SOURCE 200809L
+#include <stdlib.h>
 #include "posix_internal.h"
-
+char *realpath(const char *restrict path, char *restrict resolved_path);
 char gPosixExeDir[PATH_MAX];    // the game directory with a trailing '/': the one drive this layer presents
 char gPosixConfigDir[PATH_MAX]; // ~/.config/bgi
 char gPosixRegFile[PATH_MAX];   // the registry emulation's file (registry.txt in the configuration directory)
@@ -41,7 +48,15 @@ static void OnSignal(int sig)
 // the signal handlers, the directories, the character converters; always 1
 int OS_Init(void)
 {
+#ifdef __ANDROID__
+	/* Android has no $HOME: the Java side passes the app's writable
+	 * directory (BGI_FILES_DIR) and the game folder the user picked
+	 * (BGI_GAME_DIR) */
+	const char* files = getenv("BGI_FILES_DIR");
+	const char* game = getenv("BGI_GAME_DIR");
+#else
 	const char* home = getenv("HOME");
+#endif
 	signal(SIGTERM, OnSignal);
 	signal(SIGINT, OnSignal);
 	/* The original lives in the game's directory and makes that its base
@@ -51,9 +66,25 @@ int OS_Init(void)
 	if(!getcwd(gPosixExeDir, sizeof gPosixExeDir - 2))
 		strcpy(gPosixExeDir, ".");
 	strcat(gPosixExeDir, "/");
+#ifdef __ANDROID__
+	if(game && *game && !OS_SetGameDir(game))
+		fprintf(stderr, "bgi: BGI_GAME_DIR (%s) is not a directory\n", game);
+#endif
 	OsPosix_SjisInit();
+#ifdef __ANDROID__
+	snprintf(gPosixConfigDir, sizeof gPosixConfigDir, "%s/.config/bgi", files && *files ? files : ".");
+	{
+		/* mkdir creates one level at a time and a fresh app files directory
+		 * has no .config yet: make the parent first (EEXIST once it is
+		 * there, ignored as below) */
+		char config[PATH_MAX];
+		snprintf(config, sizeof config, "%s/.config", files && *files ? files : ".");
+		mkdir(config, 0755);
+	}
+#else
 	snprintf(gPosixConfigDir, sizeof gPosixConfigDir, "%s/.config/bgi", home ? home : ".");
-	mkdir(gPosixConfigDir, 0755);
+#endif
+	mkdir(gPosixConfigDir, 0755); // EEXIST when it is already there
 	snprintf(gPosixRegFile, sizeof gPosixRegFile, "%s/registry.txt", gPosixConfigDir);
 	return 1;
 }

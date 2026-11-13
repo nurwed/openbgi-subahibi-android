@@ -11,24 +11,175 @@
 #include "bgi/os.h"
 #include "bgi/display.h"
 
+#if defined(__ANDROID__)
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include "bgi/android_prof.h"
+
+// ---- the start-up / load profiler (Android only, see android_prof.h) ------
+
+static uint64_t gAndroidProfBaseUs; // AndroidProf_Begin: the process-start mark
+
+/* The heavy per-open / per-read / per-blit / per-second lines are off
+ * unless asked for: BGI_PROF in the environment (anything but empty or
+ * "0"), or a file <BGI_FILES_DIR>/prof.txt that adb can push.  The answer
+ * is cached, so a marker pushed while the game runs takes effect on the
+ * next start.  Phases and failures ignore it (AndroidProf_Err). */
+static int gAndroidProfOn = -1;
+
+int AndroidProf_Enabled(void)
+{
+	if(gAndroidProfOn < 0)
+	{
+		const char* env = getenv("BGI_PROF");
+		int on = env && *env && !(env[0] == '0' && !env[1]);
+		if(!on)
+		{
+			const char* dir = getenv("BGI_FILES_DIR");
+			char marker[0x400];
+			struct stat st;
+			if(dir && *dir && snprintf(marker, sizeof marker, "%s/prof.txt", dir) < (int)sizeof marker)
+				on = stat(marker, &st) == 0;
+		}
+		gAndroidProfOn = on;
+	}
+	return gAndroidProfOn;
+}
+
+uint64_t AndroidProf_Us(void)
+{
+	struct timespec ts;
+	if(clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+uint32_t AndroidProf_Ms(void)
+{
+	uint64_t now = AndroidProf_Us();
+	return gAndroidProfBaseUs && now >= gAndroidProfBaseUs ? (uint32_t)((now - gAndroidProfBaseUs) / 1000) : 0;
+}
+
+// one fwrite: the loader/script/audio threads share stderr, and a line
+// assembled in three stdio calls could otherwise interleave with theirs
+static void ProfWrite(const char* fmt, va_list ap)
+{
+	char line[1024];
+	uint32_t ms = AndroidProf_Ms();
+	int n = snprintf(line, sizeof line, "prof: t=%u.%03u ", ms / 1000, ms % 1000);
+	if(n < 0 || (size_t)n >= sizeof line)
+		return;
+	vsnprintf(line + n, sizeof line - (size_t)n, fmt, ap);
+	n = (int)strlen(line);
+	if(n + 1 < (int)sizeof line)
+	{
+		line[n++] = '\n';
+		line[n] = 0;
+	}
+	fwrite(line, 1, (size_t)n, stderr);
+	fflush(stderr);
+}
+
+void AndroidProf_Log(const char* fmt, ...)
+{
+	va_list ap;
+	if(!AndroidProf_Enabled())
+		return;
+	va_start(ap, fmt);
+	ProfWrite(fmt, ap);
+	va_end(ap);
+}
+
+void AndroidProf_Err(const char* fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	ProfWrite(fmt, ap);
+	va_end(ap);
+}
+
+void AndroidProf_Begin(void)
+{
+	gAndroidProfBaseUs = AndroidProf_Us();
+	fprintf(stderr, "prof: t=0.000 process start (monotonic %llu us)\n", (unsigned long long)gAndroidProfBaseUs);
+	fflush(stderr);
+}
+
+void AndroidProf_Phase(const char* what)
+{
+	AndroidProf_Err("phase %s", what);
+}
+
+// the large allocations (BGI_LOAD_BUFFER is 128 MB) and their per-second count
+static uint64_t gProfAllocSec;
+static unsigned gProfAllocCount;
+static uint64_t gProfAllocBytes;
+static uint64_t gProfAllocUs;
+
+static void ProfAlloc_Tick(uint64_t nowUs)
+{
+	uint64_t sec = nowUs / 1000000u;
+	if(gProfAllocSec == 0)
+	{
+		gProfAllocSec = sec;
+		return;
+	}
+	if(sec == gProfAllocSec)
+		return;
+	if(gProfAllocCount)
+		AndroidProf_Log("alloc 1s: %u calls, %llu bytes, %llu us", gProfAllocCount,
+			(unsigned long long)gProfAllocBytes, (unsigned long long)gProfAllocUs);
+	gProfAllocSec = sec;
+	gProfAllocCount = 0;
+	gProfAllocBytes = 0;
+	gProfAllocUs = 0;
+}
+#endif
+
 // ---- allocation ----------------------------------------------------------
 
 // malloc that never returns NULL: the process is aborted when memory runs out (n = 0 gives a 1-byte block)
 void* BGI_Alloc(size_t n)
 {
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 	void* p = malloc(n ? n : 1);
 	if(!p)
 	{
 		fprintf(stderr, "bgi: out of memory (%lu bytes)\n", (unsigned long)n);
 		abort();
 	}
+#if defined(__ANDROID__)
+	if(n >= ((size_t)4 << 20))
+	{ // BGI_LOAD_BUFFER and the big decode buffers: mmap cost, and how often
+		uint64_t dt = AndroidProf_Us() - t0;
+		ProfAlloc_Tick(t0);
+		gProfAllocCount++;
+		gProfAllocBytes += n;
+		gProfAllocUs += dt;
+		AndroidProf_Log("alloc %lu B in %llu us%s", (unsigned long)n, (unsigned long long)dt, dt >= 2000 ? " SLOW" : "");
+	}
+#endif
 	return p;
 }
 
 void* BGI_Calloc(size_t n)
 {
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+	uint64_t t1;
+#endif
 	void* p = BGI_Alloc(n);
 	memset(p, 0, n);
+#if defined(__ANDROID__)
+	t1 = AndroidProf_Us();
+	if(n >= ((size_t)4 << 20))
+		AndroidProf_Log("calloc %lu B zeroed in %llu us", (unsigned long)n, (unsigned long long)(t1 - t0));
+#endif
 	return p;
 }
 

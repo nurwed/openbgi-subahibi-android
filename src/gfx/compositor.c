@@ -416,6 +416,11 @@ int Compositor_SplitBands(Compositor_t* c, Rect_t* out, const Rect_t* r)
 	int32_t h = r->b - r->t + 1, n, i, y = r->t;
 	if(rows == 0)
 		rows = 1;
+	/* at most the rectangle's own rows: a 0xffffffff budget ("no cache size
+	 * known", the case off x86) divided by a one-pixel-wide rectangle gives
+	 * 0xffffffff rows, which the int32_t conversion below turns into -1 */
+	else if(h > 0 && rows > (uint32_t)h)
+		rows = (uint32_t)h;
 	n = (int32_t)(((int64_t)h + (int64_t)rows - 1) / (int64_t)rows);
 	if(out && n > 0)
 	{

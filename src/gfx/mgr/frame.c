@@ -189,10 +189,16 @@ uint32_t Gfx_SplitCopyJobs(Rect_t* out, const Rect_t* r, uint32_t pixelsPerJob)
 	uint32_t width = (uint32_t)(r->r - r->l + 1);
 	uint32_t rowsPer = pixelsPerJob / width;
 	uint32_t height = (uint32_t)(r->b - r->t); // exclusive: rows - 1
+	uint32_t rowsAll = height + 1;             // the rectangle's rows
 	uint32_t count, remaining, i, y;
 
 	if(rowsPer == 0)
 		rowsPer = 1;
+	/* at most the rectangle's rows: with the 0xffffffff budget ("no cache
+	 * size known", the case off x86) a one-pixel-wide rectangle makes
+	 * height + rowsPer wrap below, so count came out 0 */
+	else if(rowsAll && rowsPer > rowsAll)
+		rowsPer = rowsAll;
 	count = (height + rowsPer) / rowsPer;
 	if(out && count > 0)
 	{

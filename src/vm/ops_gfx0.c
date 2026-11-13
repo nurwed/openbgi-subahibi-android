@@ -76,10 +76,14 @@ static int Opcode_Gfx0_DisplayEnable(Thread_t* t) // 90 01: f →
 static int Opcode_Gfx0_SetFps(Thread_t* t) // 90 02: fps →
 {
 	uint32_t fps = Thread_Pop(t);
-	// 1.58 accepted 0 .. 1000 as a signed value; from 1.64 the rate must be at least 1
-	if(gEngine->gen == GEN_1_58 ? (int)fps < 0 || (int)fps > 1000 : fps < 1 || fps > 1000)
+	/* 1.58 accepted 0 .. 1000 as a signed value; from 1.64 the rate must be at
+	 * least 1.  Subarashiki Hibi (engine 1.643.1) calls "90 02" with 0 in its
+	 * boot program, so builds from 1.640 on take 0 again: it is not an error
+	 * there, and means "no fixed rate" (a 60 Hz default here). */
+	int zeroOk = gEngine->gen == GEN_1_58 || gEngine->gen >= GEN_1_640;
+	if(gEngine->gen == GEN_1_58 ? (int)fps < 0 || (int)fps > 1000 : fps > 1000 || (fps < 1 && !zeroOk))
 		GFX_ERROR(t, MSG_BAD_FRAME_RATE, (int)fps);
-	Present_SetRate((int)fps);
+	Present_SetRate(fps == 0 ? 60 : (int)fps);
 	return 0;
 }
 

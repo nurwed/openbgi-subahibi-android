@@ -28,6 +28,10 @@
 #include "bgi/version.h"
 #include "bgi/os.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 /* Archive entry names are limited to 15 characters (the PackFile entry);
  * the builds with BURIKO ARC20 archives (1.573 on) allow 95.  A longer
  * name is a script error. */
@@ -499,9 +503,15 @@ uint32_t GetFileSize_(const char* arc, const char* name)
 	uint8_t* buf;
 	uint32_t n;
 	char path[0x104];
+#if defined(__ANDROID__)
+	uint64_t t0;
+#endif
 	if(gEngine->gen >= GEN_1_69_472)
 		return GetFileSizeDecoded(arc, name);
-	buf = (uint8_t*)BGI_Alloc(0x2000000);
+#if defined(__ANDROID__)
+	t0 = AndroidProf_Us();
+#endif
+	buf = (uint8_t*)BGI_Alloc(BGI_LOAD_BUFFER);
 	memset(buf, 0, 16); // so that the DSC magic test fails on an empty read
 	n = ReadWholeFile(buf, gBaseDir, name);
 	if(!arc)
@@ -524,6 +534,10 @@ uint32_t GetFileSize_(const char* arc, const char* name)
 	if(n && BGI_IsDsc(buf))
 		n = BGI_DscOutSize(buf);
 	BGI_Free(buf);
+#if defined(__ANDROID__)
+	AndroidProf_Log("loadbuf %u B GetFileSize_ %s/%s -> %u B, memset 16 B, in %llu us (legacy path)", (unsigned)BGI_LOAD_BUFFER,
+		arc && *arc ? arc : "(base)", name, n, (unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	return n;
 }
 

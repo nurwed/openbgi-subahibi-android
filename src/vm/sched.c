@@ -33,6 +33,10 @@
 #include "bgi/os.h"
 #include "bgi/dbg.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 uint32_t gSwitchThreadId;   // the thread that gets the turn after scheduler code 3 ("80 5E")
 int gExclusiveOn;           // 1 while only gExclusiveThread runs ("80 5D")
 Thread_t* gExclusiveThread; // that thread
@@ -70,6 +74,9 @@ uint32_t SpawnThread(const char* arc, const char* name, uint32_t stackEntries,
 	uint8_t* image = (uint8_t*)BGI_Alloc(0x20000);
 	uint32_t id = 0;
 	char msg[0x104];
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 
 	if(LoadFile(image, arc, name) == 0)
 	{
@@ -88,6 +95,10 @@ uint32_t SpawnThread(const char* arc, const char* name, uint32_t stackEntries,
 		}
 		id = Thread_GetId(t);
 	}
+#if defined(__ANDROID__)
+	AndroidProf_Log("script %s%s%s loaded in %llu us, id %u", arc && *arc ? arc : "(base)",
+		arc && *arc ? "/" : "", name, (unsigned long long)(AndroidProf_Us() - t0), (unsigned)id);
+#endif
 	BGI_Free(image);
 	return id;
 }
@@ -291,6 +302,9 @@ int VmMain(void)
 	{
 		gSched.restart = 0;
 		Vm_ResetSubsystems();
+#if defined(__ANDROID__)
+		AndroidProf_Phase("VM reset, loading the boot program");
+#endif
 
 		gSched.bootOk = 0;
 		if(BGI_TRY(f))
@@ -304,6 +318,9 @@ int VmMain(void)
 		}
 		if(!gSched.bootOk)
 			continue; // restart is 0 here: leaves the loop
+#if defined(__ANDROID__)
+		AndroidProf_Phase("boot program loaded, first VM pass");
+#endif
 
 		gSched.running = 1;
 		while(Thread_Next(gRootThread) != NULL)

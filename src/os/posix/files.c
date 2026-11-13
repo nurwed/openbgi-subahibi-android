@@ -14,6 +14,10 @@
  */
 #include "posix_internal.h"
 
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
+
 // ---- files -------------------------------------------------------------------------------------
 
 struct OsFile
@@ -22,11 +26,57 @@ struct OsFile
 	char path[PATH_MAX]; // the POSIX path it was opened with
 };
 
+#if defined(__ANDROID__)
+/* Per-second sums of the file work: opens, reads (the < 4 KB and the
+ * > 20 ms ones), the stat()s behind OS_FileAttrs and the directory entries
+ * read.  Each open and read also gets its own line with path and duration. */
+static struct
+{
+	uint64_t sec;
+	unsigned opens, opensSlow;
+	uint64_t openUs;
+	unsigned reads, readsSmall, readsSlow;
+	uint64_t readUs, bytes;
+	unsigned stats, statsSlow;
+	uint64_t statUs;
+	unsigned finds, findEntries;
+} gProfFile;
+
+static void ProfFile_Tick(uint64_t nowUs)
+{
+	uint64_t sec = nowUs / 1000000u;
+	if(gProfFile.sec == 0)
+	{
+		gProfFile.sec = sec;
+		return;
+	}
+	if(sec == gProfFile.sec)
+		return;
+	if(gProfFile.opens || gProfFile.reads || gProfFile.stats || gProfFile.finds)
+		AndroidProf_Log(
+			"fileio 1s: opens=%u (%llu us, %u slow) reads=%u (%llu us, %llu B, %u small, %u slow) stats=%u (%llu us, %u slow) find=%u (%u entries)",
+			(unsigned)gProfFile.opens, (unsigned long long)gProfFile.openUs, (unsigned)gProfFile.opensSlow,
+			(unsigned)gProfFile.reads, (unsigned long long)gProfFile.readUs, (unsigned long long)gProfFile.bytes,
+			(unsigned)gProfFile.readsSmall, (unsigned)gProfFile.readsSlow, (unsigned)gProfFile.stats,
+			(unsigned long long)gProfFile.statUs, (unsigned)gProfFile.statsSlow, (unsigned)gProfFile.finds,
+			(unsigned)gProfFile.findEntries);
+	gProfFile.sec = sec;
+	memset(&gProfFile, 0, sizeof gProfFile);
+	gProfFile.sec = sec;
+}
+#endif
+
 // fopen "rb" of the converted path; NULL when it cannot be opened or is a directory (as CreateFile)
 OsFile_t* OS_FileOpenRead(const char* path)
 {
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 	OsFile_t* f = (OsFile_t*)calloc(1, sizeof *f);
 	struct stat st;
+#if defined(__ANDROID__)
+	st.st_size = 0;
+#endif
 	OsPosix_Path(path, f->path, sizeof f->path);
 	f->f = fopen(f->path, "rb");
 	if(f->f && fstat(fileno(f->f), &st) == 0 && S_ISDIR(st.st_mode))
@@ -36,9 +86,30 @@ OsFile_t* OS_FileOpenRead(const char* path)
 	}
 	if(!f->f)
 	{
+#if defined(__ANDROID__)
+		uint64_t dt = AndroidProf_Us() - t0;
+		ProfFile_Tick(t0);
+		gProfFile.opens++;
+		gProfFile.openUs += dt;
+		if(dt >= 20000)
+			gProfFile.opensSlow++;
+		AndroidProf_Log("open FAIL %s %llu us%s", f->path, (unsigned long long)dt, dt >= 20000 ? " SLOW" : "");
+#endif
 		free(f);
 		return NULL;
 	}
+#if defined(__ANDROID__)
+	{
+		uint64_t dt = AndroidProf_Us() - t0;
+		ProfFile_Tick(t0);
+		gProfFile.opens++;
+		gProfFile.openUs += dt;
+		if(dt >= 20000)
+			gProfFile.opensSlow++;
+		AndroidProf_Log("open %s %lld B %llu us%s", f->path, (long long)st.st_size, (unsigned long long)dt,
+			dt >= 20000 ? " SLOW" : "");
+	}
+#endif
 	return f;
 }
 
@@ -53,6 +124,9 @@ OsFile_t* OS_FileCreate(const char* path)
 		free(f);
 		return NULL;
 	}
+#if defined(__ANDROID__)
+	OsPosix_PathCacheDropPath(f->path); // the directory's listing changed
+#endif
 	return f;
 }
 
@@ -69,6 +143,9 @@ OsFile_t* OS_FileOpenWrite(const char* path)
 		free(f);
 		return NULL;
 	}
+#if defined(__ANDROID__)
+	OsPosix_PathCacheDropPath(f->path); // it may have been created just now
+#endif
 	return f;
 }
 
@@ -83,7 +160,24 @@ void OS_FileClose(OsFile_t* f)
 
 uint32_t OS_FileRead(OsFile_t* f, void* buf, uint32_t n)
 {
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+	uint32_t got = (uint32_t)fread(buf, 1, n, f->f);
+	uint64_t dt = AndroidProf_Us() - t0;
+	ProfFile_Tick(t0);
+	gProfFile.reads++;
+	gProfFile.readUs += dt;
+	gProfFile.bytes += got;
+	if(n < 4096)
+		gProfFile.readsSmall++;
+	if(dt >= 20000)
+		gProfFile.readsSlow++;
+	AndroidProf_Log("read %s %u/%u B %llu us%s%s", f->path, got, n, (unsigned long long)dt, n < 4096 ? " SMALL" : "",
+		dt >= 20000 ? " SLOW" : "");
+	return got;
+#else
 	return (uint32_t)fread(buf, 1, n, f->f);
+#endif
 }
 
 uint32_t OS_FileWrite(OsFile_t* f, const void* buf, uint32_t n)
@@ -140,8 +234,26 @@ uint32_t OS_FileAttrs(const char* path)
 	struct stat st;
 	uint32_t a = 0;
 	OsPosix_Path(path, p, sizeof p);
+#if defined(__ANDROID__)
+	{
+		uint64_t t0 = AndroidProf_Us();
+		int sr = stat(p, &st);
+		uint64_t dt = AndroidProf_Us() - t0;
+		ProfFile_Tick(t0);
+		gProfFile.stats++;
+		gProfFile.statUs += dt;
+		if(dt >= 20000)
+		{
+			gProfFile.statsSlow++;
+			AndroidProf_Log("stat SLOW %s %llu us", p, (unsigned long long)dt);
+		}
+		if(sr != 0)
+			return OS_INVALID_ATTRS;
+	}
+#else
 	if(stat(p, &st) != 0)
 		return OS_INVALID_ATTRS;
+#endif
 	if(S_ISDIR(st.st_mode))
 		a |= OS_ATTR_DIRECTORY;
 	if(!(st.st_mode & S_IWUSR))
@@ -170,6 +282,9 @@ int OS_FileDelete(const char* path)
 {
 	char p[PATH_MAX];
 	OsPosix_Path(path, p, sizeof p);
+#if defined(__ANDROID__)
+	OsPosix_PathCacheDropPath(p); // the directory's listing is about to change
+#endif
 	return unlink(p) == 0;
 }
 
@@ -182,6 +297,14 @@ int OS_FileMove(const char* from, const char* to)
 	OsPosix_Path(to, b, sizeof b);
 	if(lstat(b, &sb) == 0 && !(lstat(a, &sa) == 0 && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino))
 		return 0;
+#if defined(__ANDROID__)
+	{ // both listings change, and a moved directory takes its own listing with it
+		OsPosix_PathCacheDropPath(a);
+		OsPosix_PathCacheDropPath(b);
+		OsPosix_PathCacheDrop(a);
+		OsPosix_PathCacheDrop(b);
+	}
+#endif
 	return rename(a, b) == 0;
 }
 
@@ -198,6 +321,9 @@ int OS_FileCopy(const char* from, const char* to, int failIfExists)
 	in = fopen(a, "rb");
 	if(!in)
 		return 0;
+#if defined(__ANDROID__)
+	OsPosix_PathCacheDropPath(b); // the destination may be new
+#endif
 	out = fopen(b, "wb");
 	if(!out)
 	{
@@ -215,6 +341,12 @@ int OS_DirCreate(const char* path)
 {
 	char p[PATH_MAX];
 	OsPosix_Path(path, p, sizeof p);
+#if defined(__ANDROID__)
+	{ // the parent listing gains an entry; a record for the new directory itself would be stale
+		OsPosix_PathCacheDropPath(p);
+		OsPosix_PathCacheDrop(p);
+	}
+#endif
 	return mkdir(p, 0755) == 0;
 }
 
@@ -222,6 +354,12 @@ int OS_DirRemove(const char* path)
 {
 	char p[PATH_MAX];
 	OsPosix_Path(path, p, sizeof p);
+#if defined(__ANDROID__)
+	{
+		OsPosix_PathCacheDropPath(p);
+		OsPosix_PathCacheDrop(p);
+	}
+#endif
 	return rmdir(p) == 0;
 }
 
@@ -238,10 +376,17 @@ struct OsFind
 static int FindFill(OsFind_t* h, OsFindData_t* out)
 {
 	struct dirent* e;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+	ProfFile_Tick(t0);
+#endif
 	while((e = readdir(h->dir)) != NULL)
 	{
 		char full[PATH_MAX];
 		struct stat st;
+#if defined(__ANDROID__)
+		gProfFile.findEntries++;
+#endif
 		if(!OsCommon_WildcardMatch(h->pattern, e->d_name))
 			continue;
 		snprintf(full, sizeof full, "%s/%s", h->dirPath, e->d_name);
@@ -258,6 +403,9 @@ static int FindFill(OsFind_t* h, OsFindData_t* out)
 		}
 		// the name goes back to the engine as it is stored (UTF-8 names that are plain ASCII survive unchanged; others are not converted)
 		snprintf(out->name, sizeof out->name, "%s", e->d_name);
+#if defined(__ANDROID__)
+		gProfFile.finds++;
+#endif
 		return 1;
 	}
 	return 0;

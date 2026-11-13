@@ -1,10 +1,19 @@
 # build outputs
 obj/
 bin/
-# third-party drop-in (see the Makefile's VORBIS setting)
-src/snd/stb_vorbis.c
+build/
+.cxx/
+.gradle/
+*.o
+*.apk
+*.aab
+*.iml
 # the engine's error report, written next to the game
 BGIError.txt
+# logs and local machine configuration
+*.log
+logs/
+local.properties
 # working files, tools and notes that are not part of the project
 internal/
 __pycache__/

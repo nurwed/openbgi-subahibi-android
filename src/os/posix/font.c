@@ -43,10 +43,15 @@
 #include FT_SIZES_H
 #include FT_SYNTHESIS_H
 #include FT_TRUETYPE_TABLES_H
+#include <unistd.h>
+
+#if defined(__ANDROID__)
+#include "bgi/android_prof.h"
+#endif
 
 #ifdef BGI_HAVE_FONTCONFIG
 #include <fontconfig/fontconfig.h>
-#include <unistd.h>
+
 #endif
 
 // ---- shared faces -------------------------------------------------------------
@@ -94,9 +99,23 @@ static FaceRec_t* gFaces; // the open faces
 // the FreeType library, created on the first use; 0 when that fails
 static int FtInit(void)
 {
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 	if(gFt)
 		return 1;
+#if defined(__ANDROID__)
+	{
+		int r = FT_Init_FreeType(&gFt) == 0;
+		if(r)
+			AndroidProf_Log("freetype init ok in %llu us", (unsigned long long)(AndroidProf_Us() - t0));
+		else
+			AndroidProf_Err("freetype init FAILED in %llu us", (unsigned long long)(AndroidProf_Us() - t0));
+		return r;
+	}
+#else
 	return FT_Init_FreeType(&gFt) == 0;
+#endif
 }
 
 // OS_Shutdown: release the libraries' global state, unless a font is still open (its face would die with FreeType)
@@ -142,6 +161,11 @@ static int FindFontFile(const char* dir, const char* name, int depth, char* out,
 	DIR* d = opendir(dir);
 	struct dirent* e;
 	int found = 0;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+	uint64_t dt;
+	unsigned entries = 0;
+#endif
 	if(!d)
 		return 0;
 	while(!found && (e = readdir(d)) != NULL)
@@ -150,6 +174,9 @@ static int FindFontFile(const char* dir, const char* name, int depth, char* out,
 		struct stat st;
 		if(e->d_name[0] == '.')
 			continue;
+#if defined(__ANDROID__)
+		entries++;
+#endif
 		snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
 		if(stat(path, &st) != 0)
 			continue;
@@ -165,6 +192,12 @@ static int FindFontFile(const char* dir, const char* name, int depth, char* out,
 		}
 	}
 	closedir(d);
+#if defined(__ANDROID__)
+	dt = AndroidProf_Us() - t0;
+	if(depth == 0)
+		AndroidProf_Log("font scan %s for %s: %s, %u entries, %llu us%s", dir, name, found ? out : "not found", entries,
+			(unsigned long long)dt, dt >= 20000 ? " SLOW" : "");
+#endif
 	return found;
 }
 
@@ -182,10 +215,18 @@ static const char* const kMinchoFiles[] = {"fonts-japanese-mincho.ttf", "ipam.tt
  * class's; 0 when none is installed */
 static int ResolveByScan(int mincho, char* out, size_t n)
 {
+	int ndirs = 0, i, pass;
+	const char* dirs[6];
+#ifdef __ANDROID__
+	/* Android's fonts are the system image's and the vendor images': there
+	 * is no $HOME font directory and no fontconfig to ask. */
+	dirs[ndirs++] = "/system/fonts";
+	dirs[ndirs++] = "/product/fonts";
+	dirs[ndirs++] = "/vendor/fonts";
+	dirs[ndirs++] = "/odm/fonts";
+#else
 	const char* home = getenv("HOME");
 	char userFonts[2][1024];
-	const char* dirs[6];
-	int ndirs = 0, i, pass;
 	dirs[ndirs++] = "/etc/alternatives";
 	dirs[ndirs++] = "/usr/share/fonts";
 	dirs[ndirs++] = "/usr/local/share/fonts";
@@ -196,6 +237,7 @@ static int ResolveByScan(int mincho, char* out, size_t n)
 		dirs[ndirs++] = userFonts[0];
 		dirs[ndirs++] = userFonts[1];
 	}
+#endif
 	for(pass = 0; pass < 2; pass++)
 	{
 		const char* const* names = (mincho ^ pass) ? kMinchoFiles : kGothicFiles; // the other class as a fallback
@@ -276,11 +318,17 @@ static int ResolveFace(const char* sjisFace, int bold, int italic, char* out, si
 static FaceRec_t* FaceAcquire(const char* path, int index)
 {
 	FaceRec_t* r;
+#if defined(__ANDROID__)
+	uint64_t t0 = AndroidProf_Us();
+#endif
 	for(r = gFaces; r; r = r->next)
 	{
 		if(r->index == index && strcmp(r->path, path) == 0)
 		{
 			r->refs++;
+#if defined(__ANDROID__)
+			AndroidProf_Log("font face %s index %d reused", path, index);
+#endif
 			return r;
 		}
 	}
@@ -289,6 +337,10 @@ static FaceRec_t* FaceAcquire(const char* path, int index)
 		return NULL;
 	if(FT_New_Face(gFt, path, index, &r->face) != 0)
 	{
+#if defined(__ANDROID__)
+		AndroidProf_Err("font face %s index %d FAILED after %llu us", path, index,
+			(unsigned long long)(AndroidProf_Us() - t0));
+#endif
 		free(r);
 		return NULL;
 	}
@@ -300,6 +352,10 @@ static FaceRec_t* FaceAcquire(const char* path, int index)
 	r->refs = 1;
 	r->next = gFaces;
 	gFaces = r;
+#if defined(__ANDROID__)
+	AndroidProf_Log("font face %s index %d loaded in %llu us", path, index,
+		(unsigned long long)(AndroidProf_Us() - t0));
+#endif
 	return r;
 }
 
@@ -617,7 +673,11 @@ static int ResolveFallbackFile(OsFont_t* f, uint32_t cp, char* out, size_t n, in
 {
 	static const char* const kFiles[] = {"DejaVuSans.ttf", "NotoSansArabic-Regular.ttf", "NotoNaskhArabic-Regular.ttf",
 		"NotoSansHebrew-Regular.ttf", "FreeSans.ttf", "FreeSerif.ttf", "unifont.otf", "unifont.ttf", NULL};
+#ifdef __ANDROID__
+	static const char* const kDirs[] = {"/system/fonts", "/product/fonts", "/vendor/fonts", "/odm/fonts", NULL};
+#else
 	static const char* const kDirs[] = {"/usr/share/fonts", "/usr/local/share/fonts", NULL};
+#endif
 	const char* const* name;
 	const char* const* dir;
 	*index = 0;
