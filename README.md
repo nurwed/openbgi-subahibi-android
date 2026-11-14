@@ -6,6 +6,8 @@ adds an SDL2 back end (`src/os/sdl`) and an Android build
 (`android/CMakeLists.txt`), and keeps the existing X11/FreeType/ALSA
 desktop back end working.
 
+The android wrapper: [Wrapper](https://github.com/nurwed/Android-wrapper-for-OpenBgi)
+
 **No game data is included.**  You must own a copy of the game and point the
 engine at your own files.  Do not redistribute the game archives, images,
 sounds, movies or extracted scripts.
