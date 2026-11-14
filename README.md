@@ -1,4 +1,4 @@
-# OpenBGI — Android port
+# OpenBGI(Cytlan) - Android port
 
 This repository is an Android port of [OpenBGI](https://openbgi.net), the
 GPL-2.0 re-implementation of Ethornell's BGI visual-novel engine.  The port
