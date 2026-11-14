@@ -44,15 +44,13 @@ The game folder must contain `system.arc` (and usually `ipl._bp`).
 
 | Input | Action |
 |---|---|
-| Tap | Left click |
-| Long press (500 ms) | Right click |
-| Two-finger tap | Right click |
-| Mostly vertical swipe | Mouse wheel (one notch per 48 picture pixels) |
+| Tap | Left click | 
+| Long press | Right click |
+| Two-finger tap | Right click | Opens menu
+| Mostly vertical swipe | Mouse wheel | Log/
 | Back | Menu |
 | Corner button (top-right) | Holds the in-game button row (Skip/Auto/Save/Load/Log) up; tap again to release it |
 
-The engine polls the pointer once per frame, so a tap is delivered as a
-press 40 ms after the finger and a release 80 ms later.
 
 ## Building
 
@@ -112,14 +110,7 @@ The APK must not contain game data.  The player selects their own game
 folder.
 
 ## Known issues
-
-* Dialogue letter spacing is uneven when the requested font (Consolas) is
-  missing.  The original engine behaves the same way; `91 0D`
-  SetPropFontAdvance is not used by the glyph renderer, and this game never
-  calls it.
-* CompressedBG v2 alpha mode 2 (a Huffman-coded alpha plane) is not
-  implemented in `Cbg2_Decode`.  Pictures that use it are drawn fully
-  opaque.
+--
 
 ## License
 
