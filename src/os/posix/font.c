@@ -96,6 +96,10 @@ struct OsFont
 static FT_Library gFt;    // NULL until the first font is opened
 static FaceRec_t* gFaces; // the open faces
 
+/* a font a game loaded at run time ("B0 C2" / "B0 C3", e.g. a translation
+ * patch's own .ttf); once set it is what every face name resolves to */
+static char gCustomFontPath[1024];
+
 // the FreeType library, created on the first use; 0 when that fails
 static int FtInit(void)
 {
@@ -204,11 +208,51 @@ static int FindFontFile(const char* dir, const char* name, int depth, char* out,
 /* without fontconfig: well-known Japanese fonts in order of preference
  * (Debian's alternatives links first), DejaVu as the last resort so that
  * Latin text at least renders */
-static const char* const kGothicFiles[] = {"fonts-japanese-gothic.ttf", "ipag.ttf", "ipagp.ttf", "NotoSansCJK-Regular.ttc",
-	"NotoSansCJKjp-Regular.otf", "NotoSansJP-Regular.otf", "NotoSansCJK-Medium.ttc", "VL-Gothic-Regular.ttf",
-	"TakaoGothic.ttf", "DroidSansJapanese.ttf", "wqy-microhei.ttc", "DejaVuSans.ttf", NULL};
-static const char* const kMinchoFiles[] = {"fonts-japanese-mincho.ttf", "ipam.ttf", "ipamp.ttf", "NotoSerifCJK-Regular.ttc",
-	"NotoSerifCJKjp-Regular.otf", "NotoSerifJP-Regular.otf", "TakaoMincho.ttf", "DejaVuSerif.ttf", NULL};
+static const char* const kGothicFiles[] = {"msgothic.ttc", "MS-Gothic.ttf", "fonts-japanese-gothic.ttf", "ipag.ttf",
+	"ipagp.ttf", "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.otf", "NotoSansJP-Regular.otf",
+	"NotoSansCJK-Medium.ttc", "VL-Gothic-Regular.ttf", "TakaoGothic.ttf", "DroidSansJapanese.ttf", "wqy-microhei.ttc",
+	"DejaVuSans.ttf", NULL};
+static const char* const kMinchoFiles[] = {"msmincho.ttc", "MS-Mincho.ttf", "fonts-japanese-mincho.ttf", "ipam.ttf",
+	"ipamp.ttf", "NotoSerifCJK-Regular.ttc", "NotoSerifCJKjp-Regular.otf", "NotoSerifJP-Regular.otf", "TakaoMincho.ttf",
+	"DejaVuSerif.ttf", NULL};
+
+#ifdef __ANDROID__
+/* the game's own font: `names` looked up directly in BGI_GAME_DIR and
+ * BGI_FILES_DIR (and their fonts/ subdirectory), without the recursive
+ * scan so that a folder with many files cannot slow the start up; a game
+ * that ships msgothic.ttc thus gets MS Gothic's half-width ASCII without
+ * anything installed */
+static int FindFontInAppDirs(const char* const* names, char* out, size_t n)
+{
+	const char* appDirs[2];
+	int d;
+	appDirs[0] = getenv("BGI_GAME_DIR");
+	appDirs[1] = getenv("BGI_FILES_DIR");
+	for(; *names; names++)
+	{
+		for(d = 0; d < 2; d++)
+		{
+			char path[1024];
+			struct stat st;
+			if(!appDirs[d] || !*appDirs[d])
+				continue;
+			snprintf(path, sizeof path, "%s/%s", appDirs[d], *names);
+			if(stat(path, &st) == 0 && S_ISREG(st.st_mode))
+			{
+				snprintf(out, n, "%s", path);
+				return 1;
+			}
+			snprintf(path, sizeof path, "%s/fonts/%s", appDirs[d], *names);
+			if(stat(path, &st) == 0 && S_ISREG(st.st_mode))
+			{
+				snprintf(out, n, "%s", path);
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+#endif
 
 /* the fallback without fontconfig: the first of the class's well-known
  * files found under the system and user font directories, then the other
@@ -219,7 +263,14 @@ static int ResolveByScan(int mincho, char* out, size_t n)
 	const char* dirs[6];
 #ifdef __ANDROID__
 	/* Android's fonts are the system image's and the vendor images': there
-	 * is no $HOME font directory and no fontconfig to ask. */
+	 * is no $HOME font directory and no fontconfig to ask.  A font the game
+	 * brought along wins over the system's. */
+	for(pass = 0; pass < 2; pass++)
+	{
+		const char* const* names = (mincho ^ pass) ? kMinchoFiles : kGothicFiles;
+		if(FindFontInAppDirs(names, out, n))
+			return 1;
+	}
 	dirs[ndirs++] = "/system/fonts";
 	dirs[ndirs++] = "/product/fonts";
 	dirs[ndirs++] = "/vendor/fonts";
@@ -289,8 +340,8 @@ static int ResolveByFontconfig(const char* utf8, int mincho, int bold, int itali
 
 /* the font file (and face index) for a face name: the environment
  * override of its class first (BGI_FONT_MINCHO / BGI_FONT_GOTHIC, then
- * BGI_FONT), then fontconfig, then the directory scan; 0 when nothing
- * was found */
+ * BGI_FONT), then a font the game loaded itself, then fontconfig, then the
+ * directory scan; 0 when nothing was found */
 static int ResolveFace(const char* sjisFace, int bold, int italic, char* out, size_t n, int* index)
 {
 	char utf8[0x200];
@@ -305,6 +356,11 @@ static int ResolveFace(const char* sjisFace, int bold, int italic, char* out, si
 	if(env && *env)
 	{
 		snprintf(out, n, "%s", env);
+		return 1;
+	}
+	if(gCustomFontPath[0])
+	{
+		snprintf(out, n, "%s", gCustomFontPath);
 		return 1;
 	}
 #ifdef BGI_HAVE_FONTCONFIG
@@ -408,15 +464,23 @@ OsFont_t* OS_FontOpenMono(const char* face, int size, int bold)
 	return OS_FontOpen(face, size, size / 2, bold, 0);
 }
 
-// "B0 C2": add the file to fontconfig's application fonts, so that its family name resolves; 0 without fontconfig
+/* "B0 C2": add the file to fontconfig's application fonts, so that its
+ * family name resolves; without fontconfig (Android) the file itself
+ * becomes the custom font ResolveFace() falls back to */
 int OS_FontAddFile(const char* path)
 {
 	char native[0x400];
+	struct stat st;
 	OsPosix_SjisToUtf8(path, native, sizeof native);
 #ifdef BGI_HAVE_FONTCONFIG
 	if(FcInit() && FcConfigAppFontAddFile(NULL, (const FcChar8*)native))
 		return 1;
 #endif
+	if(stat(native, &st) == 0 && S_ISREG(st.st_mode))
+	{
+		snprintf(gCustomFontPath, sizeof gCustomFontPath, "%s", native);
+		return 1;
+	}
 	return 0;
 }
 
@@ -533,14 +597,20 @@ int OS_FontEnumFaces(char* buf, int charset, int* outBytes)
 	return count;
 }
 
-// "B0 C3": a font from an archive; 0 without fontconfig or when the file cannot be written
+/* "B0 C3": a font from an archive; it goes to a file under BGI_FILES_DIR
+ * (the writable app directory on Android) or /tmp, and becomes the custom
+ * font (or the fontconfig application font); 0 when the file cannot be
+ * written */
 int OS_FontAddMemory(const void* data, uint32_t size)
 {
-	// fontconfig takes files: the data goes to a temporary file under /tmp that is never removed
+	// fontconfig takes files: the data goes to a temporary file that is never removed
 	static int counter;
-	char path[0x100];
+	char path[0x400];
+	const char* dir = getenv("BGI_FILES_DIR");
 	FILE* f;
-	snprintf(path, sizeof path, "/tmp/bgi-font-%d-%d.ttf", (int)getpid(), counter++);
+	if(!dir || !*dir)
+		dir = "/tmp";
+	snprintf(path, sizeof path, "%s/bgi-font-%d-%d.ttf", dir, (int)getpid(), counter++);
 	f = fopen(path, "wb");
 	if(!f)
 		return 0;
@@ -550,7 +620,8 @@ int OS_FontAddMemory(const void* data, uint32_t size)
 	if(FcInit() && FcConfigAppFontAddFile(NULL, (const FcChar8*)path))
 		return 1;
 #endif
-	return 0;
+	snprintf(gCustomFontPath, sizeof gCustomFontPath, "%s", path);
+	return 1;
 }
 
 /* open a font as CreateFontA would: the face resolved to a file, scaled so
